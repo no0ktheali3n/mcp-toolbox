@@ -69,23 +69,6 @@ get_forecast(latitude=38.5816, longitude=-121.4944)
 
 Add to (or create) `claude_desktop_config.json` (exists in %AppData%/Roaming/Claude aka Users/user-name/AppData/Roaming/Claude):
 
-**macOS/Linux:**
-```json
-{
-  "mcpServers": {
-    "weather": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "/absolute/path/to/mcp-toolbox/weather",
-        "run",
-        "weather.py"
-      ]
-    }
-  }
-}
-```
-
 **Windows:**
 ```json
 {
@@ -107,10 +90,21 @@ Add to (or create) `claude_desktop_config.json` (exists in %AppData%/Roaming/Cla
 
 Run the server with streamable HTTP transport:
 
+```python
+# in tool logic where server is initialized
+mcp.run(transport="http", host="localhost", port=8000)
+```
+
 ```bash
 cd weather
 uv run weather.py  # Configure transport in weather.py
 ```
+
+- Running this server makes endpoint accessible from http://localhost:8000/mcp
+
+**REF: https://gofastmcp.com/deployment/http**
+
+**NOTE:**  This format isn't supported by Claude Desktop, currently only stdio.  Need to explore sse(deprecated)/http-streamable transports for remote / enterprise access.
 
 ## Development
 
