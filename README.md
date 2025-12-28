@@ -67,7 +67,7 @@ get_forecast(latitude=38.5816, longitude=-121.4944)
 
 ### For Claude Desktop (stdio)
 
-Add to (or create) `claude_desktop_config.json` (exists in %AppData%/Roaming/Claude aka Users/user-name/AppData/Roaming/Claude):
+Add to (or create) `claude_desktop_config.json` (exists in %AppData%/Roaming/Claude aka Users/user-name/AppData/Roaming/Claude in Windows):
 
 **Windows:**
 ```json
@@ -84,6 +84,14 @@ Add to (or create) `claude_desktop_config.json` (exists in %AppData%/Roaming/Cla
     }
   }
 }
+```
+
+#### **Usage:**
+After restarting Claude Desktop, verify `weather` shows up under connectors and that it has access to the tools `get_alerts()` and `get_forecast()` and that they are enabled.
+
+When enabled in Claude Desktop:
+```Claude
+What is the weather in and current alerts for Sacramento, California?
 ```
 
 ### For HTTP Deployment
