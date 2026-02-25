@@ -1,0 +1,23 @@
+services:
+  mcp-k8s:
+    build: .
+    container_name: mcp-k8s
+    restart: unless-stopped
+    volumes:
+      - /docker/k3d/kubeconfig-internal.yaml:/root/.kube/config:ro
+    environment:
+      - KUBECONFIG=/root/.kube/config
+    networks:
+      - traefik-proxy
+    # MCP over stdio doesn't expose HTTP ports by default
+    # Uncomment below when you're ready to expose via Traefik
+    # labels:
+    #   - "traefik.enable=true"
+    #   - "traefik.http.routers.mcp-k8s.rule=Host(`mcp-k8s.ali3n.cloud`)"
+    #   - "traefik.http.routers.mcp-k8s.entrypoints=websecure"
+    #   - "traefik.http.routers.mcp-k8s.tls.certresolver=letsencrypt"
+    #   - "traefik.http.services.mcp-k8s.loadbalancer.server.port=8000"
+
+networks:
+  traefik-proxy:
+    external: true
