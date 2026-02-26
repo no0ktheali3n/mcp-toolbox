@@ -14,7 +14,7 @@ from mcp.server.fastmcp import FastMCP
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-k8s")
 
-mcp = FastMCP("mcp-k8s")
+mcp = FastMCP("mcp-k8s", host="0.0.0.0", port=8000)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -114,7 +114,7 @@ def describe_pod(pod_name: str, namespace: str = "default") -> str:
         ],
         "events": [
             {"reason": e.reason, "message": e.message, "type": e.type}
-            for e in sorted(events.items, key=lambda x: x.last_timestamp or "", reverse=True)[:10]
+            for e in sorted(events.items, key=lambda x: x.last_timestamp or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), reverse=True)[:10]
         ],
     }
     return json.dumps(result, indent=2)
@@ -246,7 +246,7 @@ def get_events(namespace: str = "default", limit: int = 20) -> str:
             "count": e.count,
             "time": str(e.last_timestamp),
         }
-        for e in sorted(events.items, key=lambda x: x.last_timestamp or "", reverse=True)[:limit]
+        for e in sorted(events.items, key=lambda x: x.last_timestamp or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), reverse=True)[:limit]
     ]
     return json.dumps(result, indent=2)
 
@@ -274,8 +274,4 @@ def delete_resource(resource_type: str, name: str, namespace: str = "default") -
 # ── Entrypoint ───────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    mcp.run()
-
-#HTTP Transport
-#if __name__ == "__main__":
-#    mcp.run(transport="http", host="0.0.0.0", port=8000)
+    mcp.run(transport="streamable-http")
