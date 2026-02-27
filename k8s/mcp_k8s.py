@@ -108,7 +108,11 @@ def describe_pod(pod_name: str, namespace: str = "default") -> str:
                 "image": c.image,
                 "ready": c.ready,
                 "restarts": c.restart_count,
-                "state": str(c.state),
+                "state": {
+    			"running": {"started_at": str(c.state.running.started_at)} if c.state.running else None,
+    			"waiting": {"reason": c.state.waiting.reason, "message": c.state.waiting.message} if c.state.waiting else None,
+    			"terminated": {"reason": c.state.terminated.reason, "exit_code": c.state.terminated.exit_code} if c.state.terminated else None,
+		},
             }
             for c in (pod.status.container_statuses or [])
         ],
