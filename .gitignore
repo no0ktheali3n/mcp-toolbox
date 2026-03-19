@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Kubeconfig (contains cluster credentials - never commit)
+k8s/kubeconfig-internal.yaml
