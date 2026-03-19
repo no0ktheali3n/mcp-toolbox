@@ -4,7 +4,8 @@ services:
     container_name: mcp-k8s
     restart: unless-stopped
     volumes:
-      - /docker/k3d/kubeconfig-internal.yaml:/root/.kube/config:ro
+      - /home/dev/projects/persona/k8/kubeconfig-internal.yaml:/root/.kube/config:ro
+      - /usr/local/bin/kubectl:/usr/local/bin/kubectl:ro
     environment:
       - KUBECONFIG=/root/.kube/config
     networks:
