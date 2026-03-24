@@ -14,7 +14,30 @@ from mcp.server.fastmcp import FastMCP
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-k8s")
 
+# Safety mode configuration
+MCP_SAFETY_MODE = os.environ.get("MCP_SAFETY_MODE", "full")  # full, read-only, non-destructive
+
+# Define tool categories for safety mode filtering
+WRITE_TOOLS = {'apply_manifest', 'delete_resource', 'restart_deployment', 'scale_deployment', 'exec_command'}
+DESTRUCTIVE_TOOLS = {'delete_resource'}
+
 mcp = FastMCP("mcp-k8s", host="0.0.0.0", port=8000)
+
+def apply_safety_mode():
+    """Remove tools based on MCP_SAFETY_MODE environment variable"""
+    mode = os.environ.get("MCP_SAFETY_MODE", "full")
+
+    if mode == "read-only":
+        # Remove all write tools
+        for tool_name in WRITE_TOOLS:
+            if tool_name in mcp._tool_manager._tools:
+                del mcp._tool_manager._tools[tool_name]
+    elif mode == "non-destructive":
+        # Remove only destructive tools
+        for tool_name in DESTRUCTIVE_TOOLS:
+            if tool_name in mcp._tool_manager._tools:
+                del mcp._tool_manager._tools[tool_name]
+
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -41,7 +64,7 @@ def kubectl(*args: str) -> str:
 
 # ── Cluster ─────────────────────────────────────────────────────────────────────
 
-@mcp.tool()
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
 def list_namespaces() -> str:
     """List all namespaces in the cluster"""
     nss = core().list_namespace()
@@ -49,7 +72,7 @@ def list_namespaces() -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
 def get_node_status() -> str:
     """Get status and info for all nodes in the cluster"""
     nodes = core().list_node()
@@ -68,7 +91,7 @@ def get_node_status() -> str:
 
 # ── Pods ────────────────────────────────────────────────────────────────────────
 
-@mcp.tool()
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
 def list_pods(
     namespace: str = "default",
     label_selector: str = None,
@@ -163,7 +186,7 @@ def get_qos_class(pod) -> str:
         return "BestEffort"
 
 
-@mcp.tool()
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
 def get_pod_detail(pod_name: str, namespace: str = "default") -> str:
     """Get detailed info about a pod including conditions, container states, resources, and recent events"""
     pod = core().read_namespaced_pod(pod_name, namespace)
@@ -246,7 +269,7 @@ def get_pod_detail(pod_name: str, namespace: str = "default") -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
 async def find_unhealthy_pods(
     namespace: str = "",
     restart_threshold: int = 5,
@@ -329,7 +352,7 @@ async def find_unhealthy_pods(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
 def get_pod_logs(
     pod_name: str,
     namespace: str = "default",
@@ -348,7 +371,7 @@ def get_pod_logs(
     return logs or "(no logs)"
 
 
-@mcp.tool()
+@mcp.tool(annotations={"idempotent": False, "destructive": False, "read_only": False})
 def exec_command(
     pod_name: str,
     command: list[str],
@@ -370,7 +393,7 @@ def exec_command(
 
 # ── Deployments ─────────────────────────────────────────────────────────────────
 
-@mcp.tool()
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
 def list_deployments(namespace: str = "default") -> str:
     """List deployments in a namespace with replica counts and image"""
     deps = apps().list_namespaced_deployment(namespace)
@@ -387,7 +410,7 @@ def list_deployments(namespace: str = "default") -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"idempotent": False, "destructive": True, "read_only": False})
 def scale_deployment(name: str, replicas: int, namespace: str = "default") -> str:
     """Scale a deployment to a specified number of replicas (use 0 to stop)"""
     apps().patch_namespaced_deployment_scale(
@@ -396,7 +419,7 @@ def scale_deployment(name: str, replicas: int, namespace: str = "default") -> st
     return f"Scaled deployment/{name} to {replicas} replicas"
 
 
-@mcp.tool()
+@mcp.tool(annotations={"idempotent": False, "destructive": True, "read_only": False})
 def restart_deployment(name: str, namespace: str = "default") -> str:
     """Perform a rolling restart of a deployment"""
     patch = {
@@ -414,7 +437,7 @@ def restart_deployment(name: str, namespace: str = "default") -> str:
     return f"Restarted deployment/{name}"
 
 
-@mcp.tool()
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
 def get_deployment_health(name: str, namespace: str = "default") -> dict:
     """Get comprehensive health report for a deployment including replicasets, pods, and events"""
 
@@ -607,7 +630,7 @@ def get_deployment_health(name: str, namespace: str = "default") -> dict:
 
 # ── Services & Config ────────────────────────────────────────────────────────────
 
-@mcp.tool()
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
 def list_services(namespace: str = "default") -> str:
     """List services in a namespace with type and port mappings"""
     svcs = core().list_namespaced_service(namespace)
@@ -626,7 +649,7 @@ def list_services(namespace: str = "default") -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
 def list_configmaps(namespace: str = "default") -> str:
     """List configmaps in a namespace and their keys"""
     cms = core().list_namespaced_config_map(namespace)
@@ -637,7 +660,7 @@ def list_configmaps(namespace: str = "default") -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
 def get_events(
     namespace: str = "default",
     limit: int = 20,
@@ -677,7 +700,7 @@ def get_events(
 
 # ── Manifest operations ──────────────────────────────────────────────────────────
 
-@mcp.tool()
+@mcp.tool(annotations={"idempotent": False, "destructive": True, "read_only": False})
 def apply_manifest(manifest_yaml: str) -> str:
     """Apply a Kubernetes YAML manifest to the cluster"""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
@@ -689,13 +712,16 @@ def apply_manifest(manifest_yaml: str) -> str:
         os.unlink(tmp)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"idempotent": False, "destructive": True, "read_only": False})
 def delete_resource(resource_type: str, name: str, namespace: str = "default") -> str:
     """Delete a Kubernetes resource. resource_type examples: pod, deployment, service, configmap"""
     return kubectl("delete", resource_type, name, "-n", namespace)
 
 
 # ── Entrypoint ───────────────────────────────────────────────────────────────────
+
+# Apply safety mode restrictions after all tools are registered
+apply_safety_mode()
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
