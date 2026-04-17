@@ -1086,5 +1086,25 @@ def patch_resource_limits(
 # Apply safety mode restrictions after all tools are registered
 apply_safety_mode()
 
+
+# Health endpoint — lightweight probe for stack-health monitoring.
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request) -> JSONResponse:
+    try:
+        v1 = client.CoreV1Api()
+        v1.list_namespace(limit=1)
+        cluster_reachable = True
+    except Exception:
+        cluster_reachable = False
+    return JSONResponse({
+        "status": "ok" if cluster_reachable else "degraded",
+        "safety_mode": MCP_SAFETY_MODE,
+        "cluster_reachable": cluster_reachable,
+    })
+
+
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
