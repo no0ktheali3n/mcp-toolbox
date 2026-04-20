@@ -1,6 +1,7 @@
 services:
   mcp-k8s:
     build: .
+    image: mcp-k8s
     container_name: mcp-k8s
     restart: unless-stopped
     volumes:

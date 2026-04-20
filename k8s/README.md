@@ -1,0 +1,333 @@
+# mcp-k8s
+
+FastMCP-based MCP server for Kubernetes cluster management. Exposes tools for
+AI agents (Agent Zero) to interact with Kubernetes clusters via streamable-http.
+
+## Requirements
+- Docker + Docker Compose
+- kubectl on host (mounted into container)
+- k3d cluster with kubeconfig at `k8s/kubeconfig-internal.yaml`
+
+## Quick Start
+```bash
+# Copy kubeconfig from your cluster setup
+cp ~path/to/your/k8s/kubeconfig-internal.yaml k8s/kubeconfig-internal.yaml
+
+# Build and start
+docker compose -f k8s/docker-compose.yml up -d --build
+
+# Verify
+docker logs mcp-k8s --tail 20
+```
+
+## Development Workflow
+```bash
+# After making changes to k8s/mcp_k8s.py
+docker compose -f k8s/docker-compose.yml up -d --build
+docker logs mcp-k8s --tail 20
+```
+
+## Tools
+
+### Discovery Tools
+
+#### `list_namespaces()`
+List all namespaces in the cluster with their status (Active/Terminating).
+
+**Returns:** Array of `{name, status}` objects.
+
+---
+
+#### `list_pods(namespace="default", label_selector=None, field_selector=None, limit=50, all_namespaces=False)`
+List pods with filtering and pagination support.
+
+**Parameters:**
+- `namespace` — Target namespace (ignored if `all_namespaces=True`)
+- `label_selector` — Kubernetes label selector (e.g., `"app=nginx,tier=frontend"`)
+- `field_selector` — Kubernetes field selector (e.g., `"status.phase!=Running"`)
+- `limit` — Maximum pods to return (default: 50)
+- `all_namespaces` — List across all namespaces (default: False)
+
+**Returns:**
+```json
+{
+  "pods": [{
+    "name": "nginx-abc123",
+    "status": "Running",
+    "ready": "1/1",
+    "restarts": 0,
+    "node": "k3d-mcp-cluster-server-0",
+    "age": "2026-03-24T10:00:00Z"
+  }],
+  "metadata": {
+    "continue": "ey...",  // Pagination token for next page
+    "remaining_count": 0  // Approximate remaining items
+  }
+}
+```
+
+**Why it matters:** Field selectors enable powerful queries like "find all non-Running pods cluster-wide" without client-side filtering.
+
+---
+
+#### `list_deployments(namespace="default")`
+List deployments with replica counts and container image.
+
+**Returns:** Array of `{name, desired, ready, available, image}` objects.
+
+---
+
+#### `list_services(namespace="default")`
+List services with type, cluster IP, and port mappings.
+
+**Returns:** Array of `{name, type, cluster_ip, ports}` objects.
+
+---
+
+#### `list_configmaps(namespace="default")`
+List configmaps and their data keys (not values).
+
+**Returns:** Array of `{name, keys}` objects.
+
+---
+
+### Diagnosis Tools
+
+#### `get_node_status()`
+Get status and info for all cluster nodes.
+
+**Returns:** Array of `{name, ready, roles, version, os}` objects.
+
+**Why it matters:** Quick cluster health check — identifies node-level issues before diving into pod diagnosis.
+
+---
+
+#### `get_pod_detail(pod_name, namespace="default")`
+Get comprehensive pod details including conditions, container states, resources, and recent events.
+
+**Returns:**
+```json
+{
+  "name": "web-app-abc123",
+  "namespace": "default",
+  "node": "k3d-mcp-cluster-server-0",
+  "phase": "Running",
+  "qos_class": "Burstable",
+  "pod_ip": "10.42.0.15",
+  "host_ip": "172.18.0.2",
+  "conditions": [{"type": "Ready", "status": "True", "reason": ""}],
+  "containers": [{
+    "name": "app",
+    "image": "myapp:v1.2.3",
+    "ready": true,
+    "restarts": 5,
+    "state": {
+      "running": {"started_at": "2026-03-24T10:00:00Z"},
+      "waiting": null,
+      "terminated": null
+    },
+    "resources": {
+      "requests": {"cpu": "100m", "memory": "128Mi"},
+      "limits": {"cpu": "500m", "memory": "512Mi"}
+    },
+    "volume_mounts": [{"name": "config", "mount_path": "/etc/config", "read_only": true}]
+  }],
+  "events": [{"reason": "Started", "message": "...", "type": "Normal"}]
+}
+```
+
+**QoS Class explanation:**
+| Value | Meaning |
+|-------|---------|
+| `Guaranteed` | All containers have equal requests and limits — highest priority, last to be evicted |
+| `Burstable` | Some resources specified — medium priority |
+| `BestEffort` | No resources specified — first to be killed under node pressure |
+
+**Why it matters:** Single-call diagnosis — replaces `kubectl describe pod` + `kubectl get events` with structured JSON optimized for LLM consumption.
+
+---
+
+#### `find_unhealthy_pods(namespace="", restart_threshold=5, include_completed=False, limit=25, sort_by="restarts")`
+Find unhealthy pods across all namespaces or a specific namespace.
+
+**Parameters:**
+- `namespace` — Empty string = all namespaces
+- `restart_threshold` — Flag pods with restarts >= this value (default: 5)
+- `include_completed` — Include Succeeded/Failed pods (default: False)
+- `limit` — Maximum pods to return (default: 25)
+- `sort_by` — Sort key: `"restarts"` or `"age"` (default: "restarts")
+
+**Returns:**
+```json
+{
+  "pods": [{
+    "name": "crash-abc123",
+    "namespace": "default",
+    "phase": "CrashLoopBackOff",
+    "restart_count": 10,
+    "last_restart_reason": "Error",
+    "age": "2026-03-24T10:00:00Z"
+  }],
+  "total_unhealthy": 47,    // Total found before limit
+  "returned_count": 1,      // == len(pods)
+  "truncated": true         // True if total_unhealthy > limit
+}
+```
+
+**Why it matters:** Entry point for autonomous diagnosis — the agent calls this first to identify which pods need investigation.
+
+---
+
+#### `get_deployment_health(name, namespace="default")`
+Get comprehensive deployment health report including replicasets, pods, events, and rollout status.
+
+**Returns:**
+```json
+{
+  "deployment": {
+    "name": "web-app",
+    "namespace": "default",
+    "desired_replicas": 3,
+    "ready_replicas": 2,
+    "available_replicas": 2,
+    "unavailable_replicas": 1,
+    "strategy": "RollingUpdate",
+    "image": "myapp:v1.2.3"
+  },
+  "replicasets": [{
+    "name": "web-app-abc123",
+    "desired": 3,
+    "ready": 2,
+    "available": 2
+  }],
+  "pods": [{
+    "name": "web-app-abc123-xyz",
+    "phase": "Running",
+    "restart_count": 0,
+    "container_states": [{"name": "app", "state": "running"}]
+  }],
+  "events": [...],
+  "rollout_status": {
+    "progressing": false,
+    "stalled": false,
+    "complete": true
+  },
+  "conditions": [{"type": "Available", "status": "True", "reason": ""}]
+}
+```
+
+**Why it matters:** Single-call deployment diagnosis — aggregates deployment + replicasets + pods + events into one structured response.
+
+---
+
+#### `get_pod_logs(pod_name, namespace="default", container="", tail_lines=100, since_seconds=None, previous=False)`
+Get logs from a pod's container.
+
+**Parameters:**
+- `pod_name` — Pod name (required)
+- `namespace` — Namespace (default: "default")
+- `container` — Container name (required if pod has multiple containers)
+- `tail_lines` — Number of lines from end (default: 100)
+- `since_seconds` — Time window for logs (e.g., 60 = last 60 seconds)
+- `previous` — Get logs from previously terminated container (default: False)
+
+**Why it matters:** `previous=True` is essential for crash-loop diagnosis — retrieves logs from the container instance that crashed.
+
+---
+
+#### `get_events(namespace="default", limit=20, involved_object_name=None, involved_object_kind=None, event_type=None)`
+Get recent events with optional filtering.
+
+**Parameters:**
+- `namespace` — Target namespace
+- `limit` — Maximum events to return (default: 20)
+- `involved_object_name` — Filter by resource name (e.g., "nginx-abc123")
+- `involved_object_kind` — Filter by resource kind (e.g., "Pod", "Deployment")
+- `event_type` — Filter by type: "Normal" or "Warning"
+
+**Why it matters:** Field-selector filtering pushes queries to etcd — efficient for "show me only Warning events for this pod."
+
+---
+
+#### `exec_command(pod_name, command, namespace="default", container="")`
+Execute a command inside a running pod's container.
+
+**Parameters:**
+- `pod_name` — Pod name (required)
+- `command` — Command as list (e.g., `["ls", "-la"]`)
+- `namespace` — Namespace (default: "default")
+- `container` — Container name (required for multi-container pods)
+
+**Returns:** Combined stdout + stderr.
+
+---
+
+### Remediation Tools
+
+#### `scale_deployment(name, replicas, namespace="default")`
+Scale a deployment to specified replicas.
+
+**Returns:** `"Scaled deployment/{name} to {replicas} replicas"`
+
+---
+
+#### `restart_deployment(name, namespace="default")`
+Perform a rolling restart of a deployment (adds restart annotation to trigger rollout).
+
+**Returns:** `"Restarted deployment/{name}"`
+
+---
+
+#### `apply_manifest(manifest_yaml)`
+Apply a Kubernetes YAML manifest to the cluster.
+
+**Parameters:**
+- `manifest_yaml` — Full YAML string (can contain multiple documents)
+
+**Returns:** kubectl apply output.
+
+---
+
+#### `delete_resource(resource_type, name, namespace="default")`
+Delete a Kubernetes resource.
+
+**Parameters:**
+- `resource_type` — Resource kind (e.g., "pod", "deployment", "service", "configmap")
+- `name` — Resource name
+- `namespace` — Namespace (default: "default")
+
+**Returns:** kubectl delete output.
+
+---
+
+## Utility Functions (Internal)
+
+### `strip_managed_fields(obj: dict) -> dict`
+Remove verbose Kubernetes metadata from API responses:
+- `metadata.managedFields` — Internal field-manager bookkeeping (often 100+ lines)
+- `metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"]` — Full last-applied YAML
+
+**Applied to:** All tools returning Kubernetes objects (`get_pod_detail`, `get_deployment_health`).
+
+**Why it matters:** Reduces token consumption by 30-50% on typical responses.
+
+---
+
+### `get_qos_class(pod) -> str`
+Calculate pod QoS (Quality of Service) class based on resource requests/limits.
+
+**Returns:** `"Guaranteed"`, `"Burstable"`, or `"BestEffort"`
+
+| Class | Criteria | OOM Kill Priority |
+|-------|----------|-------------------|
+| `Guaranteed` | All containers have requests == limits | Last |
+| `Burstable` | Some resources specified | Medium |
+| `BestEffort` | No resources specified | First |
+
+**Why it matters:** When diagnosing why a pod was OOM killed or evicted, QoS class indicates whether the behavior was expected.
+
+---
+
+## Repos
+- Infrastructure: https://github.com/no0ktheali3n/expert-k8
+- MCP server: https://github.com/no0ktheali3n/mcp-toolbox
