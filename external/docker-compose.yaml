@@ -1,0 +1,29 @@
+services:
+  mcp-external:
+    build: .
+    image: mcp-external
+    container_name: mcp-external
+    restart: unless-stopped
+    environment:
+      - MCP_SAFETY_MODE=full
+      - GITEA_URL=http://gitea:3000
+      - GITEA_TOKEN=
+      - HARBOR_URL=http://registry:5000
+      - HARBOR_USER=
+      - HARBOR_PASSWORD=
+    ports:
+      - "8002:8002"
+    networks:
+      - traefik-proxy
+    # Traefik routing commented out until we choose a host.
+    # Agent Zero reaches this server via http://mcp-external:8002/mcp
+    # on the traefik-proxy network directly.
+    # labels:
+    #   - "traefik.enable=true"
+    #   - "traefik.http.routers.mcp-external.rule=Host(`mcp-external.localhost`)"
+    #   - "traefik.http.routers.mcp-external.entrypoints=web"
+    #   - "traefik.http.services.mcp-external.loadbalancer.server.port=8002"
+
+networks:
+  traefik-proxy:
+    external: true
