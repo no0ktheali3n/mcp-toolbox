@@ -307,12 +307,45 @@ a structured `{"error": "mutation_denied", ...}` dict without calling the API.
 
 ---
 
+#### `rollback_deployment(name, namespace="default", to_revision=None)`
+Roll a Deployment back to a previous revision. Finds the ReplicaSet that owns
+the target revision and patches the Deployment's pod template back to that
+ReplicaSet's template - same semantics as `kubectl rollout undo`.
+
+**Parameters:**
+- `name` - Deployment name
+- `namespace` - Namespace (default: "default")
+- `to_revision` - Target revision number. If `None`, rolls back to the
+  immediately-previous revision (largest revision strictly below current).
+
+**Returns:**
+```json
+{
+  "rolled_back": true,
+  "from_revision": "8",
+  "to_revision": "7"
+}
+```
+
+**Error shapes (no raise):**
+- `deployment_not_found` - Deployment doesn't exist.
+- `no_previous_revision` - Only one revision recorded; nothing to roll back to.
+- `target_revision_not_found` - Caller asked for a revision not in history.
+- `target_revision_is_current` - Caller asked to roll back to the current revision.
+- `api_error` - k8s API rejected the patch.
+- `mutation_denied` - Operator denylist includes "Deployment".
+
+**Why it matters:** After a bad deployment lands, the agent can surgically
+return to a known-good revision without needing a manifest on disk.
+
+---
+
 ### Operator mutation denylist (`MCP_K8S_DENYLIST`)
 
 Operators can forbid the agent from mutating specific Kubernetes resource
-kinds. Mutation tools (`patch_resource_limits`, `restart_deployment`)
-route through the denylist before calling the API. Denied requests
-return a structured error dict:
+kinds. Mutation tools (`patch_resource_limits`, `restart_deployment`,
+`rollback_deployment`) route through the denylist before calling the API.
+Denied requests return a structured error dict:
 
 ```json
 {
