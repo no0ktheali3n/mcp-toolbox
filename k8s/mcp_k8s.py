@@ -1512,6 +1512,103 @@ def get_resource_yaml(kind: str, name: str, namespace: str | None = None) -> dic
         "manifest": manifest,
     }
 
+# ── Loki log queries (M11) ─────────────────────────────────────────────────────
+#
+# Loki is queried via the Kubernetes API server's service-proxy endpoint rather
+# than direct HTTP. This works regardless of Docker networking between mcp-k8s
+# and the cluster — the kubeconfig already grants reach into the cluster. The
+# tradeoff is ~5-10ms extra latency per query (proxied through kube-apiserver).
+#
+# Override defaults via env vars if Loki is installed in a different namespace
+# or under a different service name:
+#   LOKI_SERVICE=loki  LOKI_PORT=3100  LOKI_NAMESPACE=monitoring
+
+
+LOKI_SERVICE = os.environ.get("LOKI_SERVICE", "loki")
+LOKI_PORT = int(os.environ.get("LOKI_PORT", "3100"))
+LOKI_NAMESPACE = os.environ.get("LOKI_NAMESPACE", "monitoring")
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def query_loki(
+    query: str,
+    start: str | None = None,
+    end: str | None = None,
+    limit: int = 100,
+) -> dict:
+    """LogQL query via the k8s API server's service-proxy to Loki.
+
+    `start`/`end` accept Loki's range formats (nanosecond epochs or RFC3339).
+    When omitted, Loki defaults to its server-side window (typically 1h).
+    Target is governed by `LOKI_SERVICE` / `LOKI_PORT` / `LOKI_NAMESPACE`
+    env vars (defaults: `loki` / `3100` / `monitoring`).
+    """
+    query_params: list[tuple[str, str]] = [("query", query), ("limit", str(limit))]
+    if start:
+        query_params.append(("start", start))
+    if end:
+        query_params.append(("end", end))
+
+    resource_path = (
+        f"/api/v1/namespaces/{LOKI_NAMESPACE}"
+        f"/services/{LOKI_SERVICE}:{LOKI_PORT}/proxy/loki/api/v1/query_range"
+    )
+
+    try:
+        api_client = core().api_client
+        raw = api_client.call_api(
+            resource_path,
+            "GET",
+            path_params={},
+            query_params=query_params,
+            header_params={"Accept": "application/json"},
+            body=None,
+            response_type=None,
+            auth_settings=["BearerToken"],
+            _preload_content=False,
+        )
+        # _preload_content=False returns the urllib3 HTTPResponse
+        resp = raw[0] if isinstance(raw, tuple) else raw
+        payload = resp.data.decode("utf-8") if hasattr(resp, "data") else str(resp)
+        data = json.loads(payload).get("data", {})
+    except ApiException as e:
+        return {"error": "loki_api_error", "status": e.status, "reason": e.reason}
+    except Exception as e:
+        return {"error": "loki_request_failed", "detail": str(e)}
+
+    streams = [
+        {"labels": s.get("stream", {}), "values": s.get("values", [])}
+        for s in data.get("result", [])
+    ]
+    return {
+        "streams": streams,
+        "result_type": data.get("resultType"),
+        "stream_count": len(streams),
+    }
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def search_logs(
+    namespace: str,
+    pattern: str,
+    time_range_seconds: int = 3600,
+    limit: int = 100,
+) -> dict:
+    """Regex search across all pod logs in a namespace via Loki.
+
+    Convenience wrapper around `query_loki` that builds the LogQL label
+    selector and time window. Fails fast if Loki is unreachable.
+    """
+    import time
+
+    end_ns = int(time.time() * 1e9)
+    start_ns = end_ns - (time_range_seconds * int(1e9))
+
+    escaped = pattern.replace('"', r'\"')
+    logql = f'{{namespace="{namespace}"}} |~ "{escaped}"'
+
+    return query_loki(logql, start=str(start_ns), end=str(end_ns), limit=limit)
+
 # ── Entrypoint ───────────────────────────────────────────────────────────────────
 
 # Apply safety mode restrictions after all tools are registered

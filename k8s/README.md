@@ -450,6 +450,63 @@ Delete a Kubernetes resource.
 
 ---
 
+### Log Query Tools (Loki)
+
+These tools reach Loki via the Kubernetes API server's service-proxy endpoint,
+so mcp-k8s does not need direct network access to Loki. The target Loki
+service is controlled by env vars (defaults for grafana/loki-stack install):
+
+| Env var | Default |
+|---|---|
+| `LOKI_SERVICE` | `loki` |
+| `LOKI_PORT` | `3100` |
+| `LOKI_NAMESPACE` | `monitoring` |
+
+---
+
+#### `query_loki(query, start=None, end=None, limit=100)`
+Execute an arbitrary LogQL query.
+
+**Parameters:**
+- `query` — LogQL expression (e.g., `'{namespace="production"} |~ "error"'`)
+- `start` / `end` — Optional Loki range markers (nanosecond epoch or RFC3339). Omit for Loki's server-side default window (~1h).
+- `limit` — Max entries per stream (default: 100)
+
+**Returns:**
+```json
+{
+  "streams": [
+    {
+      "labels": {"namespace": "...", "pod": "...", "container": "...", "app": "..."},
+      "values": [["1776897052662517418", "ts=... level=info msg=\"...\""]]
+    }
+  ],
+  "result_type": "streams",
+  "stream_count": 1
+}
+```
+
+**Error shapes:** `{"error": "loki_api_error", "status": ..., "reason": ...}` or `{"error": "loki_request_failed", "detail": "..."}`.
+
+**Why it matters:** Historical and cross-service log investigation that `get_pod_logs` cannot do — queries persist beyond pod lifetime and aggregate across deployment rollouts.
+
+---
+
+#### `search_logs(namespace, pattern, time_range_seconds=3600, limit=100)`
+Convenience wrapper for regex search across all pod logs in a namespace. Builds the LogQL `{namespace="..."} |~ "..."` selector and a time window from "now".
+
+**Parameters:**
+- `namespace` — Namespace to search
+- `pattern` — Regex pattern (LogQL `|~` syntax)
+- `time_range_seconds` — Lookback window in seconds (default: 3600 = 1h)
+- `limit` — Max entries per stream (default: 100)
+
+**Returns:** Same shape as `query_loki`.
+
+**Why it matters:** Agent-friendly entry point for "has anything logged this symptom in the last hour?" without requiring LogQL fluency.
+
+---
+
 ## Utility Functions (Internal)
 
 ### `strip_managed_fields(obj: dict) -> dict`
