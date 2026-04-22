@@ -77,17 +77,43 @@ List deployments with replica counts and container image.
 
 ---
 
-#### `list_services(namespace="default")`
-List services with type, cluster IP, and port mappings.
+#### `list_services(namespace="default", limit=100, continue_token=None)`
+List services with type, cluster IP, and port mappings. Paginated.
 
-**Returns:** Array of `{name, type, cluster_ip, ports}` objects.
+**Parameters:**
+- `namespace` — Target namespace
+- `limit` — Maximum services per page (default: 100)
+- `continue_token` — Resume token from a previous call's `continue` field
+
+**Returns:**
+```json
+{
+  "items": [{"name": "nginx", "type": "ClusterIP", "cluster_ip": "10.43.0.1", "ports": [...]}],
+  "continue": "eyJ2IjoibWV0YS5rOHMu..." // or null on the last page
+}
+```
+
+**Backward compat:** calling `list_services(namespace)` with no new params still works — the default `limit=100` is enough to return every service in a typical namespace.
 
 ---
 
-#### `list_configmaps(namespace="default")`
-List configmaps and their data keys (not values).
+#### `list_configmaps(namespace="default", limit=100, continue_token=None)`
+List configmaps and their data keys (not values). Paginated.
 
-**Returns:** Array of `{name, keys}` objects.
+**Parameters:**
+- `namespace` — Target namespace
+- `limit` — Maximum configmaps per page (default: 100)
+- `continue_token` — Resume token from a previous call's `continue` field
+
+**Returns:**
+```json
+{
+  "items": [{"name": "kube-root-ca.crt", "keys": ["ca.crt"]}],
+  "continue": null
+}
+```
+
+**Why it matters:** Large namespaces (kube-system, monitoring) can have 50+ configmaps — paging keeps responses bounded.
 
 ---
 
@@ -235,7 +261,7 @@ Get logs from a pod's container.
 
 ---
 
-#### `get_events(namespace="default", limit=20, involved_object_name=None, involved_object_kind=None, event_type=None)`
+#### `get_events(namespace="default", limit=20, involved_object_name=None, involved_object_kind=None, event_type=None, field_selector=None)`
 Get recent events with optional filtering.
 
 **Parameters:**
@@ -244,8 +270,9 @@ Get recent events with optional filtering.
 - `involved_object_name` — Filter by resource name (e.g., "nginx-abc123")
 - `involved_object_kind` — Filter by resource kind (e.g., "Pod", "Deployment")
 - `event_type` — Filter by type: "Normal" or "Warning"
+- `field_selector` — Raw Kubernetes field-selector string (e.g., `"involvedObject.kind=Pod,involvedObject.name=foo"`). Merged with the structured params above — use whichever is more convenient.
 
-**Why it matters:** Field-selector filtering pushes queries to etcd — efficient for "show me only Warning events for this pod."
+**Why it matters:** Field-selector filtering pushes queries to etcd — efficient for "show me only Warning events for this pod." The raw `field_selector` param is an escape hatch for selector combinations the structured params cannot express.
 
 ---
 

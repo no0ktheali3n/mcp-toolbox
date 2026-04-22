@@ -632,10 +632,22 @@ def get_deployment_health(name: str, namespace: str = "default") -> dict:
 # ── Services & Config ────────────────────────────────────────────────────────────
 
 @mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
-def list_services(namespace: str = "default") -> str:
-    """List services in a namespace with type and port mappings"""
-    svcs = core().list_namespaced_service(namespace)
-    result = [
+def list_services(
+    namespace: str = "default",
+    limit: int = 100,
+    continue_token: str = None,
+) -> str:
+    """List services in a namespace with type and port mappings.
+
+    Pagination: pass `limit` to cap page size and `continue_token` to resume
+    from a previous call's `continue` value. Return shape is
+    `{"items": [...], "continue": next_token_or_None}`.
+    """
+    kwargs = {"limit": limit}
+    if continue_token:
+        kwargs["_continue"] = continue_token
+    svcs = core().list_namespaced_service(namespace, **kwargs)
+    items = [
         {
             "name": s.metadata.name,
             "type": s.spec.type,
@@ -647,18 +659,38 @@ def list_services(namespace: str = "default") -> str:
         }
         for s in svcs.items
     ]
-    return json.dumps(result, indent=2)
+    next_token = None
+    if hasattr(svcs.metadata, "_continue") and svcs.metadata._continue:
+        next_token = svcs.metadata._continue
+    response = {"items": items, "continue": next_token}
+    return json.dumps(response, indent=2)
 
 
 @mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
-def list_configmaps(namespace: str = "default") -> str:
-    """List configmaps in a namespace and their keys"""
-    cms = core().list_namespaced_config_map(namespace)
-    result = [
+def list_configmaps(
+    namespace: str = "default",
+    limit: int = 100,
+    continue_token: str = None,
+) -> str:
+    """List configmaps in a namespace and their keys.
+
+    Pagination: pass `limit` to cap page size and `continue_token` to resume
+    from a previous call's `continue` value. Return shape is
+    `{"items": [...], "continue": next_token_or_None}`.
+    """
+    kwargs = {"limit": limit}
+    if continue_token:
+        kwargs["_continue"] = continue_token
+    cms = core().list_namespaced_config_map(namespace, **kwargs)
+    items = [
         {"name": cm.metadata.name, "keys": list(cm.data.keys()) if cm.data else []}
         for cm in cms.items
     ]
-    return json.dumps(result, indent=2)
+    next_token = None
+    if hasattr(cms.metadata, "_continue") and cms.metadata._continue:
+        next_token = cms.metadata._continue
+    response = {"items": items, "continue": next_token}
+    return json.dumps(response, indent=2)
 
 
 @mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
@@ -668,8 +700,16 @@ def get_events(
     involved_object_name: str = None,
     involved_object_kind: str = None,
     event_type: str = None,
+    field_selector: str = None,
 ) -> str:
-    """Get recent events in a namespace — useful for debugging failing resources"""
+    """Get recent events in a namespace — useful for debugging failing resources.
+
+    The structured `involved_object_name`, `involved_object_kind`, and
+    `event_type` params are convenience wrappers. For more control (e.g. to
+    combine multiple selectors or use the raw Kubernetes field-selector
+    syntax like `involvedObject.kind=Pod,involvedObject.name=foo`), pass
+    `field_selector` directly — it is merged with the structured params.
+    """
     field_selectors = []
     if involved_object_name:
         field_selectors.append(f"involvedObject.name={involved_object_name}")
@@ -677,11 +717,13 @@ def get_events(
         field_selectors.append(f"involvedObject.kind={involved_object_kind}")
     if event_type:
         field_selectors.append(f"type={event_type}")
-
-    field_selector = ",".join(field_selectors) if field_selectors else None
-
     if field_selector:
-        events = core().list_namespaced_event(namespace, field_selector=field_selector)
+        field_selectors.append(field_selector)
+
+    combined_selector = ",".join(field_selectors) if field_selectors else None
+
+    if combined_selector:
+        events = core().list_namespaced_event(namespace, field_selector=combined_selector)
     else:
         events = core().list_namespaced_event(namespace)
 
