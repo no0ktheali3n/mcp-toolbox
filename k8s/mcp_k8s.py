@@ -12,8 +12,17 @@ from kubernetes.client.rest import ApiException
 from kubernetes.stream import stream
 from mcp.server.fastmcp import FastMCP
 
+from mutation_guard import (
+    ACTIVE_DENYLIST,
+    denial_response,
+    guard as _guard_kind,
+    is_kind_denied,
+    load_denylist_from_env,
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-k8s")
+logger.info("mutation_guard active denylist: %s", sorted(ACTIVE_DENYLIST))
 
 # Safety mode configuration
 MCP_SAFETY_MODE = os.environ.get("MCP_SAFETY_MODE", "full")  # full, read-only, non-destructive
@@ -421,8 +430,16 @@ def scale_deployment(name: str, replicas: int, namespace: str = "default") -> st
 
 
 @mcp.tool(annotations={"idempotent": False, "destructive": True, "read_only": False})
-def restart_deployment(name: str, namespace: str = "default") -> str:
-    """Perform a rolling restart of a deployment"""
+def restart_deployment(name: str, namespace: str = "default"):
+    """Perform a rolling restart of a deployment.
+
+    Honors the operator mutation denylist (MCP_K8S_DENYLIST). If
+    "Deployment" is denied, returns a structured mutation_denied dict
+    without calling the k8s API.
+    """
+    denied = _guard_kind("Deployment", "restart_deployment")
+    if denied:
+        return denied
     patch = {
         "spec": {
             "template": {
@@ -950,6 +967,15 @@ def patch_resource_limits(
             "unsupported_kind",
             detail=f"kind must be one of {sorted(_PATCH_SUPPORTED_KINDS)}, got {kind!r}",
         )
+    # Guard 1b: operator mutation denylist
+    if is_kind_denied(kind, ACTIVE_DENYLIST):
+        _audit({**audit_base, "outcome": "denied_by_operator", "reason_rejected": "mutation_denied"})
+        return denial_response(kind, "patch_resource_limits", extra={
+            "name": name,
+            "namespace": namespace,
+            "container": container,
+            "dry_run": dry_run,
+        })
     if not limits and not requests:
         return _reject(
             "nothing_to_patch",

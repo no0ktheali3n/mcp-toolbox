@@ -300,8 +300,50 @@ Scale a deployment to specified replicas.
 
 #### `restart_deployment(name, namespace="default")`
 Perform a rolling restart of a deployment (adds restart annotation to trigger rollout).
+Honors the operator mutation denylist (see below) - if `Deployment` is denied, returns
+a structured `{"error": "mutation_denied", ...}` dict without calling the API.
 
-**Returns:** `"Restarted deployment/{name}"`
+**Returns:** `"Restarted deployment/{name}"` on success, or a mutation-denied dict.
+
+---
+
+### Operator mutation denylist (`MCP_K8S_DENYLIST`)
+
+Operators can forbid the agent from mutating specific Kubernetes resource
+kinds. Mutation tools (`patch_resource_limits`, `restart_deployment`)
+route through the denylist before calling the API. Denied requests
+return a structured error dict:
+
+```json
+{
+  "error": "mutation_denied",
+  "kind": "Secret",
+  "tool": "restart_deployment",
+  "reason": "operator denylist",
+  "denylist_env_var": "MCP_K8S_DENYLIST"
+}
+```
+
+**Default denylist:** `Secret`, `ClusterRole`, `ClusterRoleBinding`, `ServiceAccount`
+
+**Override:** set `MCP_K8S_DENYLIST` to a comma-separated list of kinds
+(PascalCase). The env var REPLACES the default; repeat the baseline kinds
+to extend it rather than replace:
+
+```bash
+# Replace default with an empty denylist (DANGEROUS)
+MCP_K8S_DENYLIST= docker compose up -d
+
+# Add Pod on top of the default
+MCP_K8S_DENYLIST=Secret,ClusterRole,ClusterRoleBinding,ServiceAccount,Pod docker compose up -d
+```
+
+Matching is case-insensitive. Denylist is read once at container start -
+it is a deploy-time decision, not a runtime toggle.
+
+Implementation: `mutation_guard.py` exposes `DEFAULT_DENYLIST`,
+`ACTIVE_DENYLIST`, `is_kind_denied()`, `load_denylist_from_env()`, and
+`guard()` as the single source of truth.
 
 ---
 

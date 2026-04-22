@@ -9,6 +9,10 @@ services:
       - /usr/local/bin/kubectl:/usr/local/bin/kubectl:ro
     environment:
       - KUBECONFIG=/root/.kube/config
+      # Optional: operator mutation denylist. Comma-separated kinds (PascalCase).
+      # When set, REPLACES the default denylist (Secret,ClusterRole,ClusterRoleBinding,ServiceAccount).
+      # Example: MCP_K8S_DENYLIST=Secret,Pod,ClusterRoleBinding
+      - MCP_K8S_DENYLIST
     networks:
       - traefik-proxy
     # MCP over stdio doesn't expose HTTP ports by default
