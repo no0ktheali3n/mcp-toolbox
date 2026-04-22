@@ -1307,6 +1307,211 @@ def rollback_deployment(
         "to_revision": str(target_rev),
     }
 
+# ── Cluster summary + search (M10) ─────────────────────────────────────────────
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def get_cluster_summary() -> dict:
+    """Single-call cluster-wide health snapshot.
+
+    Returns aggregate counts for nodes, pods, deployments, and namespaces so
+    the agent can form a top-level picture without chaining 5+ list calls.
+    """
+    # Nodes
+    nodes = core().list_node()
+    node_ready = 0
+    node_not_ready = 0
+    for n in nodes.items:
+        ready_cond = next(
+            (c for c in (n.status.conditions or []) if c.type == "Ready"),
+            None,
+        )
+        if ready_cond and ready_cond.status == "True":
+            node_ready += 1
+        else:
+            node_not_ready += 1
+
+    # Pods (all namespaces)
+    pods = core().list_pod_for_all_namespaces()
+    pod_counts = {"running": 0, "pending": 0, "failed": 0, "succeeded": 0, "crashloop": 0}
+    for p in pods.items:
+        phase = (p.status.phase or "").lower()
+        if phase in pod_counts:
+            pod_counts[phase] += 1
+        for cs in (p.status.container_statuses or []):
+            if cs.state and cs.state.waiting and cs.state.waiting.reason == "CrashLoopBackOff":
+                pod_counts["crashloop"] += 1
+                break
+
+    # Deployments (all namespaces)
+    deps = apps().list_deployment_for_all_namespaces()
+    dep_available = 0
+    dep_progressing = 0
+    dep_stuck = 0
+    for d in deps.items:
+        conds = (d.status.conditions or []) if d.status else []
+        is_available = any(c.type == "Available" and c.status == "True" for c in conds)
+        is_progressing = any(c.type == "Progressing" and c.status == "True" for c in conds)
+        is_stuck = any(
+            c.type == "Progressing" and c.reason == "ProgressDeadlineExceeded"
+            for c in conds
+        )
+        if is_stuck:
+            dep_stuck += 1
+        elif is_available:
+            dep_available += 1
+        elif is_progressing:
+            dep_progressing += 1
+
+    nss = core().list_namespace()
+
+    return {
+        "nodes": {"ready": node_ready, "not_ready": node_not_ready, "total": len(nodes.items)},
+        "pods": pod_counts,
+        "deployments": {
+            "available": dep_available,
+            "progressing": dep_progressing,
+            "stuck": dep_stuck,
+            "total": len(deps.items),
+        },
+        "namespace_count": len(nss.items),
+    }
+
+
+# Mapping: kind → (list_namespaced_fn_name, list_all_ns_fn_name, api_getter)
+_SEARCH_KIND_DISPATCH = {
+    "pod": ("list_namespaced_pod", "list_pod_for_all_namespaces", "core"),
+    "service": ("list_namespaced_service", "list_service_for_all_namespaces", "core"),
+    "configmap": ("list_namespaced_config_map", "list_config_map_for_all_namespaces", "core"),
+    "secret": ("list_namespaced_secret", "list_secret_for_all_namespaces", "core"),
+    "deployment": ("list_namespaced_deployment", "list_deployment_for_all_namespaces", "apps"),
+    "daemonset": ("list_namespaced_daemon_set", "list_daemon_set_for_all_namespaces", "apps"),
+    "statefulset": ("list_namespaced_stateful_set", "list_stateful_set_for_all_namespaces", "apps"),
+    "job": ("list_namespaced_job", "list_job_for_all_namespaces", "batch"),
+}
+
+
+def _get_api(name: str):
+    if name == "core":
+        return core()
+    if name == "apps":
+        return apps()
+    if name == "batch":
+        return client.BatchV1Api()
+    raise ValueError(f"unknown api: {name}")
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def search_resources(
+    kind: str,
+    label_selector: str | None = None,
+    field_selector: str | None = None,
+    namespace: str | None = None,
+    limit: int = 100,
+    continue_token: str | None = None,
+) -> dict:
+    """Label/field-selector search across a given resource kind.
+
+    Supported kinds: pod, deployment, service, configmap, secret, job,
+    daemonset, statefulset. Pass `namespace=None` to search cluster-wide.
+    Pagination via `limit` + `continue_token`.
+    """
+    kind_lower = kind.lower().rstrip("s") if kind.lower().endswith("sets") else kind.lower()
+    if kind_lower not in _SEARCH_KIND_DISPATCH:
+        return {
+            "error": "unsupported_kind",
+            "kind": kind,
+            "supported": sorted(_SEARCH_KIND_DISPATCH.keys()),
+        }
+
+    ns_fn, all_ns_fn, api_name = _SEARCH_KIND_DISPATCH[kind_lower]
+    api = _get_api(api_name)
+
+    kwargs = {"limit": limit}
+    if label_selector:
+        kwargs["label_selector"] = label_selector
+    if field_selector:
+        kwargs["field_selector"] = field_selector
+    if continue_token:
+        kwargs["_continue"] = continue_token
+
+    try:
+        if namespace:
+            result = getattr(api, ns_fn)(namespace, **kwargs)
+        else:
+            result = getattr(api, all_ns_fn)(**kwargs)
+    except ApiException as e:
+        return {"error": "api_error", "status": e.status, "reason": e.reason}
+
+    items = [
+        {
+            "kind": kind_lower,
+            "name": r.metadata.name,
+            "namespace": r.metadata.namespace,
+            "created": r.metadata.creation_timestamp.isoformat() if r.metadata.creation_timestamp else None,
+        }
+        for r in result.items
+    ]
+    next_token = None
+    if hasattr(result.metadata, "_continue") and result.metadata._continue:
+        next_token = result.metadata._continue
+
+    return {"items": items, "continue": next_token, "count": len(items)}
+
+
+# Mapping: kind → (read_fn_name, api_getter, is_namespaced)
+_YAML_KIND_DISPATCH = {
+    "pod": ("read_namespaced_pod", "core", True),
+    "service": ("read_namespaced_service", "core", True),
+    "configmap": ("read_namespaced_config_map", "core", True),
+    "secret": ("read_namespaced_secret", "core", True),
+    "namespace": ("read_namespace", "core", False),
+    "node": ("read_node", "core", False),
+    "persistentvolume": ("read_persistent_volume", "core", False),
+    "persistentvolumeclaim": ("read_namespaced_persistent_volume_claim", "core", True),
+    "deployment": ("read_namespaced_deployment", "apps", True),
+    "daemonset": ("read_namespaced_daemon_set", "apps", True),
+    "statefulset": ("read_namespaced_stateful_set", "apps", True),
+    "replicaset": ("read_namespaced_replica_set", "apps", True),
+    "job": ("read_namespaced_job", "batch", True),
+}
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def get_resource_yaml(kind: str, name: str, namespace: str | None = None) -> dict:
+    """Return the raw manifest (as a dict) for any supported resource.
+
+    Useful when the agent needs to reason about drift — the full spec
+    is returned with managed-fields stripped.
+    """
+    kind_lower = kind.lower()
+    if kind_lower not in _YAML_KIND_DISPATCH:
+        return {
+            "error": "unsupported_kind",
+            "kind": kind,
+            "supported": sorted(_YAML_KIND_DISPATCH.keys()),
+        }
+    fn_name, api_name, is_namespaced = _YAML_KIND_DISPATCH[kind_lower]
+    api = _get_api(api_name)
+
+    try:
+        if is_namespaced:
+            if not namespace:
+                return {"error": "namespace_required", "kind": kind_lower}
+            obj = getattr(api, fn_name)(name, namespace)
+        else:
+            obj = getattr(api, fn_name)(name)
+    except ApiException as e:
+        return {"error": "api_error", "status": e.status, "reason": e.reason, "kind": kind, "name": name}
+
+    manifest = strip_managed_fields(obj.to_dict())
+    return {
+        "kind": kind_lower,
+        "name": name,
+        "namespace": namespace,
+        "manifest": manifest,
+    }
+
 # ── Entrypoint ───────────────────────────────────────────────────────────────────
 
 # Apply safety mode restrictions after all tools are registered

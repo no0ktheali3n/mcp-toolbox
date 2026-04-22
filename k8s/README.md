@@ -117,6 +117,54 @@ List configmaps and their data keys (not values). Paginated.
 
 ---
 
+#### `get_cluster_summary()`
+Single-call cluster-wide health snapshot — aggregates nodes, pods, deployments, and namespaces into one structured response.
+
+**Returns:**
+```json
+{
+  "nodes": {"ready": 3, "not_ready": 0, "total": 3},
+  "pods": {"running": 47, "pending": 0, "failed": 0, "succeeded": 2, "crashloop": 0},
+  "deployments": {"available": 15, "progressing": 0, "stuck": 0, "total": 15},
+  "namespace_count": 8
+}
+```
+
+**Why it matters:** Lets the agent form a top-level cluster picture with one tool call instead of chaining 5+ list calls.
+
+---
+
+#### `search_resources(kind, label_selector=None, field_selector=None, namespace=None, limit=100, continue_token=None)`
+Label/field-selector search across any supported resource kind. Pass `namespace=None` to search cluster-wide.
+
+**Supported kinds:** `pod`, `service`, `configmap`, `secret`, `deployment`, `daemonset`, `statefulset`, `job`
+
+**Returns:**
+```json
+{
+  "items": [{"kind": "deployment", "name": "nginx", "namespace": "default", "created": "2026-04-22T..."}],
+  "continue": "eyJ2...",
+  "count": 1
+}
+```
+
+**Why it matters:** Replaces `kubectl get {kind} -l label=value -A` with a structured, paginated API — essential for the agent when hunting for resources by label without knowing the namespace.
+
+---
+
+#### `get_resource_yaml(kind, name, namespace=None)`
+Return the full manifest (as a dict) for any supported resource with `managedFields` stripped.
+
+**Supported kinds (namespaced):** `pod`, `service`, `configmap`, `secret`, `deployment`, `daemonset`, `statefulset`, `replicaset`, `job`, `persistentvolumeclaim`
+
+**Supported kinds (cluster-scoped):** `namespace`, `node`, `persistentvolume`
+
+**Returns:** `{"kind": "deployment", "name": "nginx", "namespace": "default", "manifest": { ... full spec ... }}`
+
+**Why it matters:** Drift diagnosis — the agent can pull the live spec and reason about divergence from source-of-truth without needing a separate kubectl wrapper.
+
+---
+
 ### Diagnosis Tools
 
 #### `get_node_status()`
