@@ -1,8 +1,22 @@
-# mcp-external — Gitea + Harbor MCP server
+# mcp-external — Gitea + OCI registry MCP server
 
-**Status:** M12 follow-on complete (2026-04-22). `health_check` +
-four `harbor_*` + five `gitea_*` read tools are live. Image 
-tag: `mcp-external:0.2.0-gitea-tools`.
+**Status:** M12 follow-on complete + Scenario 1 validated
+(2026-04-23). `health_check` + four `harbor_*` + five `gitea_*`
+read tools are live; agent autonomously diagnoses the
+tag-format-mismatch scenario end-to-end.
+
+**Registry-backend pivot (2026-04-23):** the `harbor_*` tools now
+target the OCI Distribution API v2 (`/v2/`) directly rather than
+Harbor's project-scoped `/api/v2.0/` endpoints. Tool names are
+preserved for prompt-vocabulary stability, but the implementations
+work against plain `registry:2`, Harbor, ECR, GCR, or any v2-
+compliant backend. The local stack runs `registry:2` paired with
+`joxit/docker-registry-ui` (see `../registry/docker-compose.yaml`)
+so the demo can show repository + tag listings in a browser while
+the agent hits the same data via `/v2/`. Full Harbor stayed out of
+this pivot — it ran into rsyslog / systemd interop issues on WSL
+that would have eaten the time budget without changing the
+agent-side capability.
 
 ## Purpose
 
@@ -52,22 +66,32 @@ Python edit.
 
 ## Tool surface
 
-**Live today:**
+**Live today (OCI `/v2/` backend):**
 - `health_check` — reports configured external endpoints + planned tools
-- `harbor_check_tag(project, repository, tag)` — **PoC-CRITICAL** (Scenario 1).
-  Returns `{"exists": bool, "tag", "project", "repository"}`. 404 from Harbor
-  is treated as `exists: False` (not an error).
-- `harbor_list_tags(project, repository, limit=50)` — **PoC-CRITICAL** (Scenario 1).
-  Flattens Harbor's artifact->tags structure; returns
-  `{"tags": [{name, pushed, digest}], "count", ...}`.
-- `harbor_get_repository_info(project, repository)` — raw repo record
-  (description, `artifact_count`, `pull_count`, timestamps).
-- `harbor_list_projects(limit=20)` — `{"projects": [...], "count"}`.
+- `harbor_check_tag(repository, tag)` — **PoC-CRITICAL** (Scenario 1).
+  `GET /v2/{repository}/manifests/{tag}`. Returns
+  `{"exists": bool, "repository", "tag", "digest"}` — 404 surfaces
+  as `exists: False` (not an error). `repository` is the slash-joined
+  path (e.g. `"demo/whoami"`); the Harbor `project` parameter was
+  retired in the pivot since plain v2 registries have no project concept.
+- `harbor_list_tags(repository, limit=50)` — **PoC-CRITICAL** (Scenario 1).
+  `GET /v2/{repository}/tags/list`. Returns
+  `{"repository", "tags": [...tag_names], "count"}`. For per-tag
+  digests, loop `harbor_check_tag` (each response carries
+  `Docker-Content-Digest`).
+- `harbor_get_repository_info(repository)` — aggregates tag count +
+  tag list (registry:2 has no dedicated repo-metadata endpoint).
+- `harbor_list_projects(limit=100)` — `GET /v2/_catalog`. Derives
+  "project" buckets from the first path segment of each repository
+  name (so `demo/whoami` contributes to project `demo`). Retains the
+  Harbor vocabulary for prompt stability; flat repo list is in
+  `repositories`.
 
-All harbor tools auth via `HARBOR_USER` / `HARBOR_PASSWORD` basic auth,
-10 s timeout, never raise on expected HTTP conditions (404/401/403) —
-they return structured `{"error": "...", "status": N, "reason": "..."}`
-payloads so the agent can reason about outcome without try/except.
+All registry tools use optional basic auth (`HARBOR_USER` +
+`HARBOR_PASSWORD`); the local stack runs anonymous. 10 s timeout,
+never raise on expected HTTP conditions — structured
+`{"error": "registry_api_error" | "registry_request_failed", ...}`
+payloads so the agent reasons about outcomes without try/except.
 
 **Gitea tools (`gitea_*`, all read-only, 10 s timeout, never raise):**
 - `gitea_get_file_content(owner, repo, path, ref="main")` — **PoC-CRITICAL**
@@ -119,18 +143,30 @@ shell. Never hard-code the token into `docker-compose.yaml`.
 
 ## Fixtures
 
-Placeholder scenario drivers live under `fixtures/`:
-- `test_scenario_1_missing_image_tag.sh`
-- `test_scenario_2_invalid_helm_values.sh`
-
-Both print a stub message today and will be implemented alongside the
-real tool code.
+- **`test_scenario_1_tag_mismatch.sh`** — end-to-end validated
+  (2026-04-23). Pushes `demo/whoami:{1.2.1,1.2.2,1.2.3}` (no `v`
+  prefix) to the registry, deploys a Kubernetes `Deployment` that
+  references `registry:5000/demo/whoami:v1.2.3`, documents the split-
+  screen demo orientation, and prints the synthetic-alert curl to
+  bypass the Prometheus `for: 5m` timer. Agent autonomously calls
+  `harbor_check_tag` + `harbor_list_tags` and diagnoses "tag format
+  mismatch, not a CI build failure."
+- `test_scenario_1_missing_image_tag.sh` — original stub, superseded
+  by the tag-mismatch script above.
+- `test_scenario_2_invalid_helm_values.sh` — still a stub; lands in
+  M12's next push alongside the `values.schema.json` path.
 
 ## Related infra (persona stack)
 
 - `../gitea/docker-compose.yaml` — Gitea on `gitea.localhost`
-- `../registry/docker-compose.yaml` — registry:2 on host port 5000
-- `../agent-zero/cutover.py` — MCP client config (adds this server)
+- `../registry/docker-compose.yaml` — `registry:2` on `registry.localhost`
+  (+ host port 5000) and `joxit/docker-registry-ui` on
+  `registry-ui.localhost`
+- `../k3d/registries.yaml` + `setup-registry-certs.sh` — insecure-
+  HTTP mirror config so k3d nodes can pull from `registry:5000`
+  without TLS + without masking 404s with the HTTPS-fallback error
+- `../agent-zero/cutover.py` — MCP client config (adds this server
+  under the `external` key)
 
 ## Dual-repo note
 
