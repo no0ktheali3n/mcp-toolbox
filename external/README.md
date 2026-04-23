@@ -1,72 +1,140 @@
-# external — Gitea + Harbor MCP server
+# mcp-external — Gitea + Harbor MCP server
 
-Standalone MCP tool server that exposes Gitea and Harbor (OCI
-registry) operations to MCP clients. Companion to `../k8s/` in this
-repo.
+**Status:** M12 follow-on complete (2026-04-22). `health_check` +
+four `harbor_*` + five `gitea_*` read tools are live. Image 
+tag: `mcp-external:0.2.0-gitea-tools`.
 
-## Status
+## Purpose
 
-M12 scaffolding (2026-04-22). Ships with a placeholder `health_check`
-MCP tool and a plain `/health` HTTP route so consumers can verify
-connectivity and endpoint configuration. Real Gitea and Harbor tools
-land in a follow-on release.
+Extend the persona-k8s agent's diagnostic reach beyond the Kubernetes
+cluster. When an alert roots in an external system (image registry,
+Git repo, Helm chart), the agent pivots through this MCP server to
+trace the actual source.
 
-## Installation
+Reference plan: `persona/k8/plans/ADD_ON_A_EXTERNAL_SYSTEMS.md`.
+
+## Runtime
+
+| Field | Value |
+|---|---|
+| Image | `mcp-external` (built from this Dockerfile) |
+| Container name | `mcp-external` |
+| Network | `traefik-proxy` (container-to-container with agent0) |
+| Port | `8002` (host-exposed; Traefik labels commented until needed) |
+| Transport | streamable-http |
+| MCP endpoint | `http://mcp-external:8002/mcp` (from agent0) or `http://localhost:8002/mcp` (from host) |
+| Health | `GET http://localhost:8002/health` returns 200 JSON |
+| Safety mode | `MCP_SAFETY_MODE=full|read-only|non-destructive` (default: full) |
+
+## Configuration (env vars)
+
+| Var | Default | Purpose |
+|---|---|---|
+| `GITEA_URL` | `http://gitea:3000` | Gitea base URL (stack-local default) |
+| `GITEA_TOKEN` | _host env_ | Gitea API token — docker-compose reads `${GITEA_TOKEN}` from the host shell. **Never commit a literal token.** See "Gitea token bootstrap" below. |
+| `HARBOR_URL` | `http://registry:5000` | Harbor/registry base URL |
+| `HARBOR_USER` | _empty_ | Harbor basic-auth user (unused for registry:2) |
+| `HARBOR_PASSWORD` | _empty_ | Harbor basic-auth password |
+| `MCP_SAFETY_MODE` | `full` | Tool filter mode |
+
+## Dev loop (matches mcp-k8s pattern)
 
 ```bash
-cd external
+cd ~/projects/persona/k8/docker/mcp-external
 docker build -t mcp-external .
-docker run --rm -p 8002:8002 \
-  -e GITEA_URL=https://gitea.example.com \
-  -e GITEA_TOKEN=... \
-  -e HARBOR_URL=https://harbor.example.com \
-  -e HARBOR_USER=... \
-  -e HARBOR_PASSWORD=... \
-  mcp-external
+docker compose up -d
+curl -sS http://localhost:8002/health
+docker logs -f mcp-external
 ```
 
-Server listens on `0.0.0.0:8002` (streamable-http). Point your MCP
-client at `http://<host>:8002/mcp`. Liveness: `GET /health`.
+Source is baked into the image (no volume mount). Rebuild after every
+Python edit.
 
-## Configuration
+## Tool surface
 
-| Env var | Default | Notes |
-|---|---|---|
-| `GITEA_URL` | `http://gitea:3000` | Override for your Gitea instance |
-| `GITEA_TOKEN` | _empty_ | Personal access token |
-| `HARBOR_URL` | `http://registry:5000` | Works with Harbor or plain registry:2 |
-| `HARBOR_USER` | _empty_ | Basic-auth credentials (Harbor mode) |
-| `HARBOR_PASSWORD` | _empty_ | — |
-| `MCP_SAFETY_MODE` | `full` | `full` / `read-only` / `non-destructive` |
+**Live today:**
+- `health_check` — reports configured external endpoints + planned tools
+- `harbor_check_tag(project, repository, tag)` — **PoC-CRITICAL** (Scenario 1).
+  Returns `{"exists": bool, "tag", "project", "repository"}`. 404 from Harbor
+  is treated as `exists: False` (not an error).
+- `harbor_list_tags(project, repository, limit=50)` — **PoC-CRITICAL** (Scenario 1).
+  Flattens Harbor's artifact->tags structure; returns
+  `{"tags": [{name, pushed, digest}], "count", ...}`.
+- `harbor_get_repository_info(project, repository)` — raw repo record
+  (description, `artifact_count`, `pull_count`, timestamps).
+- `harbor_list_projects(limit=20)` — `{"projects": [...], "count"}`.
 
-## Planned tools
+All harbor tools auth via `HARBOR_USER` / `HARBOR_PASSWORD` basic auth,
+10 s timeout, never raise on expected HTTP conditions (404/401/403) —
+they return structured `{"error": "...", "status": N, "reason": "..."}`
+payloads so the agent can reason about outcome without try/except.
 
-**Gitea (read):**
-- `gitea_get_file_content`
-- `gitea_get_chart_metadata` — parses `Chart.yaml` + `values.schema.json`
-- `gitea_get_recent_commits`
-- `gitea_list_branches`
-- `gitea_search_code`
+**Gitea tools (`gitea_*`, all read-only, 10 s timeout, never raise):**
+- `gitea_get_file_content(owner, repo, path, ref="main")` — **PoC-CRITICAL**
+  (Scenario 2). Returns `{path, size, encoding, content (base64),
+  decoded (utf-8), sha, ref}`.
+- `gitea_get_chart_metadata(owner, repo, chart_path, ref="main")` —
+  **PoC-CRITICAL** (Scenario 2). Fetches `Chart.yaml` + `values.yaml`
+  (+ `values.schema.json` if present) under `{chart_path}/`, parses
+  YAML/JSON into dicts. Returns `{chart, values, schema, missing: [...]}`.
+- `gitea_get_recent_commits(owner, repo, limit=10, path=None)` — returns
+  `{commits: [{sha, author, email, date, message}], count}`.
+- `gitea_list_branches(owner, repo)` — returns
+  `{branches: [{name, commit_sha}], count}`.
+- `gitea_search_code(owner, repo, query, limit=20, ref="main")` — portable
+  substring search (Gitea OSS has no repo-scoped code-search endpoint on
+  1.22). Walks the git tree recursively and line-matches. Caps: 200 files
+  scanned, 256 KiB per file. Returns
+  `{matches: [{path, line, text}], count, scanned_files, skipped_large,
+  source: "tree+raw"}`.
 
-**Harbor / OCI Distribution (read):**
-- `harbor_check_tag`
-- `harbor_list_tags`
-- `harbor_get_repository_info`
-- `harbor_list_projects`
+## Gitea token bootstrap
 
-**Post-PoC write tools** (documented, not built): `gitea_create_pull_request`,
-`gitea_update_file`, `harbor_retag_image`, `harbor_trigger_scan`.
+On first run the Gitea admin and a read-only token must be created by
+hand (no auto-seed in the current compose). One-time:
 
-## Conventions
+```bash
+# 1) create admin user (idempotent if it already exists)
+docker exec -u git gitea gitea admin user create \
+  --username giteaadmin --password changeme-demo-only \
+  --email admin@gitea.localhost --admin --must-change-password=false
 
-- Python 3.12+ / FastMCP
-- All tools: `@mcp.tool(...)` with `async def`
-- Return dict/JSON, never raw YAML
-- Tool names domain-prefixed (`gitea_*`, `harbor_*`) so multiple MCP
-  servers can co-exist in a single agent runtime without collision
+# 2) generate a read-only token for mcp-external
+docker exec -u git gitea gitea admin user generate-access-token \
+  --username giteaadmin --token-name mcp-external \
+  --scopes "read:repository,read:user,read:organization"
+# → prints: Access token was successfully created: <40-hex>
+
+# 3) export to host shell (do NOT commit) and recreate the container
+export GITEA_TOKEN=<40-hex>
+cd ~/projects/persona/k8/docker/mcp-external
+docker compose up -d --force-recreate
+curl -sS http://localhost:8002/health | jq '.endpoints.gitea.authenticated'
+# → true
+```
+
+For long-lived bench setups put the export into `~/.bashrc` or a
+local `.env` file — the compose file reads `${GITEA_TOKEN}` from the
+shell. Never hard-code the token into `docker-compose.yaml`.
 
 ## Fixtures
 
-`fixtures/` contains shell scripts that seed defective workloads used
-to validate end-to-end scenarios. Placeholder today; wired up
-alongside the real tools.
+Placeholder scenario drivers live under `fixtures/`:
+- `test_scenario_1_missing_image_tag.sh`
+- `test_scenario_2_invalid_helm_values.sh`
+
+Both print a stub message today and will be implemented alongside the
+real tool code.
+
+## Related infra (persona stack)
+
+- `../gitea/docker-compose.yaml` — Gitea on `gitea.localhost`
+- `../registry/docker-compose.yaml` — registry:2 on host port 5000
+- `../agent-zero/cutover.py` — MCP client config (adds this server)
+
+## Dual-repo note
+
+Source is mirrored to `~/projects/mcp-toolbox/external/` per the
+persona dual-repo workflow (see top-level `CLAUDE.md`). That copy is
+the authoritative standalone repo; this copy is the dev integration
+with the running stack.
