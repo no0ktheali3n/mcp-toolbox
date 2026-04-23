@@ -212,7 +212,7 @@ note" and `k8s/README.md` for the exact mirror commands.
 
 ## License
 
-See `LICENSE` if present. Repo defaults pending an explicit license file.
+MIT — see [`LICENSE`](LICENSE).
 
 ## Acknowledgments
 
