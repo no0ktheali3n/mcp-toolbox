@@ -20,12 +20,10 @@ agent-side capability.
 
 ## Purpose
 
-Extend the persona-k8s agent's diagnostic reach beyond the Kubernetes
-cluster. When an alert roots in an external system (image registry,
-Git repo, Helm chart), the agent pivots through this MCP server to
-trace the actual source.
-
-Reference plan: `persona/k8/plans/ADD_ON_A_EXTERNAL_SYSTEMS.md`.
+Extend a Kubernetes-specialized agent's diagnostic reach beyond
+the cluster itself. When an alert roots in an external system
+(image registry, Git repo, Helm chart), the agent pivots through
+this MCP server to trace the actual source.
 
 ## Runtime
 

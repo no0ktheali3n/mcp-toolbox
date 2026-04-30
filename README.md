@@ -6,18 +6,19 @@ directory, versioned independently, and deployable on its own.
 
 ## Overview
 
-MCP Toolbox hosts the servers the [Persona](https://gitea.apexanalytix.app/analytics/apex-ai-experts-persona)
-expert agents consume (Kubernetes operations + external-systems access),
-plus a reference weather server kept from the repo's original template.
-Each server evolves on its own tag cadence so a breaking change in one
-doesn't drag the others along.
+MCP Toolbox hosts a collection of Model Context Protocol servers
+that domain-specialized agent / persona projects consume —
+Kubernetes operations + external-systems (Gitea + OCI registry)
+access, plus a reference weather server kept from the repo's
+original template. Each server evolves on its own tag cadence so a
+breaking change in one doesn't drag the others along.
 
 ## Project Structure
 
 ```
 mcp-toolbox/
-├── k8s/        # mcp-k8s — Kubernetes operations MCP server (consumed by Persona K8s SRE expert)
-├── external/   # mcp-external — Gitea + OCI registry MCP server (Persona add-on A)
+├── k8s/        # mcp-k8s — Kubernetes operations MCP server
+├── external/   # mcp-external — Gitea + OCI registry MCP server
 ├── weather/    # reference National Weather Service MCP server (kept from template)
 └── README.md   # this file
 ```
@@ -37,8 +38,9 @@ mcp-toolbox/
 
 ### mcp-k8s (`k8s/`)
 
-Kubernetes operations MCP server. Backs Eidikos, the Persona K8s SRE
-expert, via Agent Zero. 23 tools span:
+Kubernetes operations MCP server. Designed to back any
+domain-specialized SRE / operations agent (Agent Zero or any
+runtime that speaks streamable-http MCP). 23 tools span:
 
 - **Discovery** — `get_cluster_summary`, `search_resources`, `list_*`
 - **Diagnosis** — event + log access (`get_events`, `get_pod_logs`,
@@ -199,10 +201,16 @@ note" and `k8s/README.md` for the exact mirror commands.
 
 ## Consumers
 
-- **[Persona — Eidikos (K8s SRE expert)](https://gitea.apexanalytix.app/analytics/apex-ai-experts-persona)**
-  consumes `mcp-k8s` + `mcp-external` through Agent Zero. Other Persona
-  experts (Hecate, Argus, Archon, Hephaestus) will land their own
-  MCP surfaces here as they come online.
+These servers are designed for any agent runtime that speaks
+streamable-http MCP. The reference consumer pattern is an Agent
+Zero deployment running a domain-specialized agent (e.g. an SRE
+expert) that loads `mcp-k8s` for in-cluster diagnosis +
+remediation and `mcp-external` for source-of-truth lookups against
+Gitea + OCI registries during incident triage.
+
+Additional MCP servers covering other domains (ticketing,
+databases, build / CI, cloud-vendor APIs) can land alongside as
+peer top-level directories with their own tag cadence.
 
 ## Resources
 
