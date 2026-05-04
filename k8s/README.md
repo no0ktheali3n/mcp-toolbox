@@ -392,8 +392,8 @@ return to a known-good revision without needing a manifest on disk.
 
 Operators can forbid the agent from mutating specific Kubernetes resource
 kinds. Mutation tools (`patch_resource_limits`, `restart_deployment`,
-`rollback_deployment`) route through the denylist before calling the API.
-Denied requests return a structured error dict:
+`rollback_deployment`, `delete_resource`) route through the denylist
+before calling the API. Denied requests return a structured error dict:
 
 ```json
 {
@@ -439,14 +439,17 @@ Apply a Kubernetes YAML manifest to the cluster.
 ---
 
 #### `delete_resource(resource_type, name, namespace="default")`
-Delete a Kubernetes resource.
+Delete a Kubernetes resource. Honors the operator mutation denylist (see
+above) — if `resource_type` matches a denied kind (case-insensitive),
+returns a structured `{"error": "mutation_denied", ...}` dict without
+calling the API.
 
 **Parameters:**
 - `resource_type` — Resource kind (e.g., "pod", "deployment", "service", "configmap")
 - `name` — Resource name
 - `namespace` — Namespace (default: "default")
 
-**Returns:** kubectl delete output.
+**Returns:** kubectl delete output on success, or a mutation-denied dict.
 
 ---
 
