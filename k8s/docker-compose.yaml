@@ -5,7 +5,10 @@ services:
     container_name: mcp-k8s
     restart: unless-stopped
     volumes:
-      - /home/dev/projects/persona/k8/kubeconfig-internal.yaml:/root/.kube/config:ro
+      # Consumer must provide a kubeconfig at this path (relative to the
+      # compose file) or override via MCP_K8S_KUBECONFIG, e.g.:
+      #   MCP_K8S_KUBECONFIG=/path/to/kubeconfig.yaml docker compose up -d
+      - ${MCP_K8S_KUBECONFIG:-./kubeconfig.yaml}:/root/.kube/config:ro
       - /usr/local/bin/kubectl:/usr/local/bin/kubectl:ro
     environment:
       - KUBECONFIG=/root/.kube/config
@@ -19,7 +22,7 @@ services:
     # Uncomment below when you're ready to expose via Traefik
     # labels:
     #   - "traefik.enable=true"
-    #   - "traefik.http.routers.mcp-k8s.rule=Host(`mcp-k8s.ali3n.cloud`)"
+    #   - "traefik.http.routers.mcp-k8s.rule=Host(`mcp-k8s.example.com`)"
     #   - "traefik.http.routers.mcp-k8s.entrypoints=websecure"
     #   - "traefik.http.routers.mcp-k8s.tls.certresolver=letsencrypt"
     #   - "traefik.http.services.mcp-k8s.loadbalancer.server.port=8000"
