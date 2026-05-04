@@ -100,6 +100,33 @@ passes &= ok(isinstance(r, dict) and r.get("error") == "mutation_denied",
 mcp_k8s.ACTIVE_DENYLIST.clear()
 mcp_k8s.ACTIVE_DENYLIST.update(saved)
 
+print("\n=== Test 11: delete_resource denied for default-denylist kind ===")
+# Secret is on the default denylist. delete_resource should refuse to call
+# kubectl and return the mutation_denied dict directly.
+r = mcp_k8s.delete_resource(resource_type="Secret", name="some-secret", namespace="default")
+passes &= ok(isinstance(r, dict) and r.get("error") == "mutation_denied",
+             "delete_resource(Secret) returns mutation_denied dict", str(r)[:160])
+passes &= ok(isinstance(r, dict) and r.get("tool") == "delete_resource",
+             "tool field is 'delete_resource'")
+
+print("\n=== Test 12: delete_resource guard is case-insensitive ===")
+# Lowercase "secret" must still match "Secret" in the denylist.
+r = mcp_k8s.delete_resource(resource_type="secret", name="some-secret", namespace="default")
+passes &= ok(isinstance(r, dict) and r.get("error") == "mutation_denied",
+             "delete_resource(secret) (lowercase) still denied", str(r)[:160])
+
+print("\n=== Test 13: delete_resource allowed for non-denied kind ===")
+# Pod is not on the default denylist, so the guard should pass through.
+# We can't actually invoke kubectl in this unit test environment without a
+# real cluster, but we can verify the guard does NOT short-circuit by
+# checking the result is NOT a mutation_denied dict. Whether kubectl
+# succeeds or 404s on the actual delete is beside the point of THIS test.
+r = mcp_k8s.delete_resource(resource_type="Pod", name="nonexistent-pod-for-guard-test", namespace="default")
+denied_out = isinstance(r, dict) and r.get("error") == "mutation_denied"
+passes &= ok(not denied_out,
+             "delete_resource(Pod) is NOT short-circuited by the guard",
+             "kubectl response: " + (str(r)[:120]))
+
 print("\n" + "=" * 60)
 print(f"OVERALL: {'ALL PASS' if passes else 'FAILURES PRESENT'}")
 sys.exit(0 if passes else 1)

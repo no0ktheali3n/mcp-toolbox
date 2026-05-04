@@ -774,7 +774,17 @@ def apply_manifest(manifest_yaml: str) -> str:
 
 @mcp.tool(annotations={"idempotent": False, "destructive": True, "read_only": False})
 def delete_resource(resource_type: str, name: str, namespace: str = "default") -> str:
-    """Delete a Kubernetes resource. resource_type examples: pod, deployment, service, configmap"""
+    """Delete a Kubernetes resource. resource_type examples: pod, deployment, service, configmap.
+
+    Honors the operator mutation denylist (`MCP_K8S_DENYLIST`). If the
+    `resource_type` matches a denied kind (case-insensitive), returns a
+    structured `{"error": "mutation_denied", ...}` dict without invoking
+    kubectl. Default-denied kinds: Secret, ClusterRole, ClusterRoleBinding,
+    ServiceAccount.
+    """
+    denied = _guard_kind(resource_type, "delete_resource")
+    if denied:
+        return denied
     return kubectl("delete", resource_type, name, "-n", namespace)
 
 
