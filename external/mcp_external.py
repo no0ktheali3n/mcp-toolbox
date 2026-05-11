@@ -31,7 +31,7 @@ logger = logging.getLogger("mcp-external")
 
 MCP_SAFETY_MODE = os.environ.get("MCP_SAFETY_MODE", "full")
 
-WRITE_TOOLS: set[str] = set()
+WRITE_TOOLS: set[str] = {"detector_submit_rca"}
 DESTRUCTIVE_TOOLS: set[str] = set()
 
 GITEA_URL = os.environ.get("GITEA_URL", "http://gitea:3000").rstrip("/")
@@ -40,6 +40,9 @@ GITEA_TIMEOUT = 10.0
 HARBOR_URL = os.environ.get("HARBOR_URL", "http://registry:5000")
 HARBOR_USER = os.environ.get("HARBOR_USER", "")
 HARBOR_PASSWORD = os.environ.get("HARBOR_PASSWORD", "")
+DETECTOR_URL = os.environ.get("DETECTOR_URL", "").rstrip("/")
+DETECTOR_API_KEY = os.environ.get("DETECTOR_API_KEY", "")
+DETECTOR_TIMEOUT = 30.0
 
 mcp = FastMCP("mcp-external", host="0.0.0.0", port=8002)
 
@@ -61,6 +64,11 @@ def _status_payload() -> dict:
                 "configured": bool(HARBOR_URL),
                 "authenticated": bool(HARBOR_USER and HARBOR_PASSWORD),
             },
+            "detector": {
+                "url": DETECTOR_URL,
+                "configured": bool(DETECTOR_URL),
+                "authenticated": bool(DETECTOR_API_KEY),
+            },
         },
         "tools_planned": {
             "gitea": [
@@ -75,6 +83,9 @@ def _status_payload() -> dict:
                 "harbor_list_tags",
                 "harbor_get_repository_info",
                 "harbor_list_projects",
+            ],
+            "detector": [
+                "detector_submit_rca",
             ],
         },
     }
@@ -701,8 +712,138 @@ async def gitea_search_code(
     }
 
 
+# ── Detector callback ─────────────────────────────────────────────────────────
+#
+# Write tool that publishes an operator-authored (or operator-supervised) RCA
+# to a Gefyra-compatible detector service via POST /incidents/manual. The
+# detector handles persistence, share-link minting, and dashboard surfacing —
+# this tool is a thin HTTP client so the surface stays portable across detector
+# implementations.
+#
+# Endpoint contract:
+#   POST {DETECTOR_URL}/incidents/manual
+#     {title, rca_md, investigator,
+#      [namespace, resource_kind, resource_name, severity,
+#       tags, investigation_source]}
+#   →  201 {incident_id, dashboard_url, share_url, expires_at}
+#
+# Auth: optional X-API-KEY header sourced from DETECTOR_API_KEY. The detector
+# enforces it only if its own MANUAL_RCA_API_KEYS env list is populated.
+
+
+def _detector_headers() -> dict[str, str]:
+    h = {"Content-Type": "application/json", "Accept": "application/json"}
+    if DETECTOR_API_KEY:
+        h["X-API-KEY"] = DETECTOR_API_KEY
+    return h
+
+
+@mcp.tool(annotations={"idempotent": False, "destructive": False, "read_only": False})
+async def detector_submit_rca(
+    title: str,
+    rca_md: str,
+    investigator: str,
+    namespace: str = "manual",
+    resource_kind: str = "Investigation",
+    resource_name: str = "manual-investigation",
+    severity: str = "info",
+    tags: Optional[list[str]] = None,
+    investigation_source: Optional[str] = None,
+) -> dict:
+    """Publish a manually-authored RCA to the detector dashboard.
+
+    Use after an operator has reviewed (and possibly edited) a draft RCA —
+    the call writes to the detector's incident store and mints a share
+    URL. This is a write operation; gate it behind an explicit operator
+    confirmation in the calling agent skill rather than firing it
+    autonomously mid-investigation.
+
+    Args:
+        title: One-line summary; becomes the incident's display title.
+        rca_md: Markdown body of the RCA (10–65536 chars enforced
+            server-side).
+        investigator: Operator email or display name; surfaces as the
+            analyst attribution on the rendered RCA report.
+        namespace: K8s namespace under investigation; defaults to
+            ``"manual"`` when the RCA isn't K8s-scoped.
+        resource_kind: Resource kind being investigated; defaults to
+            ``"Investigation"``.
+        resource_name: Resource name being investigated; defaults to
+            ``"manual-investigation"``.
+        severity: ``info`` / ``warning`` / ``critical``; defaults to
+            ``"info"``.
+        tags: Free-form tags for filtering / search in the dashboard.
+        investigation_source: Optional provenance hint (e.g.
+            ``"agent-chat-session-<id>"``, ``"operator-prompt-<date>"``).
+
+    Returns:
+        On success: ``{"ok": True, "incident_id": "<uuid>",
+        "dashboard_url": "...", "share_url": "...", "expires_at": "..."}``.
+        On failure: ``{"error": "<code>", ...}`` with one of
+        ``detector_not_configured``, ``detector_request_failed``,
+        ``detector_auth_failed``, ``validation_failed``,
+        ``detector_api_error``, ``detector_response_invalid``.
+    """
+    if not DETECTOR_URL:
+        return {
+            "error": "detector_not_configured",
+            "detail": "DETECTOR_URL is not set in this MCP server's environment.",
+        }
+
+    payload: dict[str, Any] = {
+        "title": title,
+        "rca_md": rca_md,
+        "investigator": investigator,
+        "namespace": namespace,
+        "resource_kind": resource_kind,
+        "resource_name": resource_name,
+        "severity": severity,
+        "tags": tags or [],
+    }
+    if investigation_source:
+        payload["investigation_source"] = investigation_source
+
+    url = f"{DETECTOR_URL}/incidents/manual"
+    try:
+        async with httpx.AsyncClient(timeout=DETECTOR_TIMEOUT) as client:
+            resp = await client.post(url, json=payload, headers=_detector_headers())
+    except httpx.HTTPError as exc:
+        logger.warning("detector request failed: %s %s", url, exc)
+        return {"error": "detector_request_failed", "detail": str(exc)}
+
+    if resp.status_code == 401:
+        return {
+            "error": "detector_auth_failed",
+            "detail": (
+                "Detector rejected X-API-KEY. Confirm DETECTOR_API_KEY is "
+                "set and matches one of the detector's accepted keys."
+            ),
+        }
+    if resp.status_code == 422:
+        try:
+            return {"error": "validation_failed", "detail": resp.json()}
+        except ValueError:
+            return {"error": "validation_failed", "detail": resp.text[:500]}
+    if resp.status_code >= 400:
+        return {
+            "error": "detector_api_error",
+            "status": resp.status_code,
+            "reason": resp.text[:500] if resp.text else resp.reason_phrase,
+        }
+
+    try:
+        body = resp.json()
+    except ValueError:
+        return {"error": "detector_response_invalid", "detail": resp.text[:500]}
+
+    return {"ok": True, **body}
+
+
 if __name__ == "__main__":
     apply_safety_mode()
     logger.info("mcp-external starting on 0.0.0.0:8002 (streamable-http)")
-    logger.info("GITEA_URL=%s  HARBOR_URL=%s", GITEA_URL, HARBOR_URL)
+    logger.info(
+        "GITEA_URL=%s  HARBOR_URL=%s  DETECTOR_URL=%s",
+        GITEA_URL, HARBOR_URL, DETECTOR_URL or "(unset)",
+    )
     mcp.run(transport="streamable-http")
