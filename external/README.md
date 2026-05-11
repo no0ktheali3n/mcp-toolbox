@@ -1,9 +1,12 @@
-# mcp-external — Gitea + OCI registry MCP server
+# mcp-external — Gitea + OCI registry + detector callback MCP server
 
-**Status:** M12 follow-on complete + Scenario 1 validated
-(2026-04-23). `health_check` + four `harbor_*` + five `gitea_*`
-read tools are live; agent autonomously diagnoses the
-tag-format-mismatch scenario end-to-end.
+**Status:** Tool surface is `health_check` + four `harbor_*` + five
+`gitea_*` read tools + one `detector_*` write tool. Originally shipped
+as the M12 follow-on (2026-04-23, Scenario 1 validated end-to-end with
+the agent autonomously diagnosing the tag-format-mismatch). Extended
+2026-05-11 with the `detector_submit_rca` write tool that pairs with
+the operator-gated `rca-publish` agent skill to publish manually
+authored RCAs back into a Gefyra-compatible detector dashboard.
 
 **Registry-backend pivot (2026-04-23):** the `harbor_*` tools now
 target the OCI Distribution API v2 (`/v2/`) directly rather than
@@ -47,7 +50,9 @@ this MCP server to trace the actual source.
 | `HARBOR_URL` | `http://registry:5000` | Harbor/registry base URL |
 | `HARBOR_USER` | _empty_ | Harbor basic-auth user (unused for registry:2) |
 | `HARBOR_PASSWORD` | _empty_ | Harbor basic-auth password |
-| `MCP_SAFETY_MODE` | `full` | Tool filter mode |
+| `DETECTOR_URL` | _empty_ | Detector base URL for `detector_submit_rca`. Unset = tool returns `detector_not_configured` and degrades gracefully. |
+| `DETECTOR_API_KEY` | _empty_ | Optional `X-API-KEY` for the detector. Required only when the detector's own `MANUAL_RCA_API_KEYS` list is populated. |
+| `MCP_SAFETY_MODE` | `full` | Tool filter mode (`detector_submit_rca` is in `WRITE_TOOLS`, so `read-only` mode strips it). |
 
 ## Dev loop (matches mcp-k8s pattern)
 
@@ -109,6 +114,20 @@ payloads so the agent reasons about outcomes without try/except.
   scanned, 256 KiB per file. Returns
   `{matches: [{path, line, text}], count, scanned_files, skipped_large,
   source: "tree+raw"}`.
+
+**Detector tools (`detector_*`, write, 30 s timeout):**
+- `detector_submit_rca(title, rca_md, investigator, namespace="manual",
+  resource_kind="Investigation", resource_name="manual-investigation",
+  severity="info", tags=None, investigation_source=None)` — POSTs to
+  `{DETECTOR_URL}/incidents/manual`. Returns
+  `{ok: True, incident_id, dashboard_url, share_url, expires_at}` on
+  success; structured `{error: <code>, ...}` on failure with codes
+  `detector_not_configured` / `detector_request_failed` /
+  `detector_auth_failed` / `validation_failed` /
+  `detector_api_error` / `detector_response_invalid`. Designed to pair
+  with an operator-gated agent skill — never call autonomously
+  mid-investigation; the write needs operator confirmation upstream.
+  Included in `WRITE_TOOLS`, so `MCP_SAFETY_MODE=read-only` strips it.
 
 ## Gitea token bootstrap
 
