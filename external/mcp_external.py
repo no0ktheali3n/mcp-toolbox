@@ -34,6 +34,43 @@ MCP_SAFETY_MODE = os.environ.get("MCP_SAFETY_MODE", "full")
 WRITE_TOOLS: set[str] = {"detector_submit_rca"}
 DESTRUCTIVE_TOOLS: set[str] = set()
 
+# Per-domain tool sets. Each set names the tools registered for that
+# domain so they can be stripped at startup when the domain is
+# unavailable in the deployment (e.g., before credentials are
+# provisioned). Same shape as WRITE_TOOLS — purely a set lookup.
+GITEA_TOOLS: set[str] = {
+    "gitea_get_file_content",
+    "gitea_get_chart_metadata",
+    "gitea_get_recent_commits",
+    "gitea_list_branches",
+    "gitea_search_code",
+}
+HARBOR_TOOLS: set[str] = {
+    "harbor_check_tag",
+    "harbor_list_tags",
+    "harbor_get_repository_info",
+    "harbor_list_projects",
+}
+DETECTOR_TOOLS: set[str] = {"detector_submit_rca"}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean env var. Accepts 1/true/yes/on (case-insensitive)
+    as truthy; anything else falsy. Returns `default` when unset."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Per-domain enable flags. Defaults are `true` to preserve the
+# all-tools-on posture for greenfield deployments; operators flip a
+# flag to `false` when a domain isn't usable yet (e.g., no credentials
+# provisioned) so the agent doesn't see tools it can't actually call.
+GITEA_TOOLS_ENABLED = _env_bool("MCP_EXTERNAL_GITEA_ENABLED", True)
+HARBOR_TOOLS_ENABLED = _env_bool("MCP_EXTERNAL_HARBOR_ENABLED", True)
+DETECTOR_TOOLS_ENABLED = _env_bool("MCP_EXTERNAL_DETECTOR_ENABLED", True)
+
 GITEA_URL = os.environ.get("GITEA_URL", "http://gitea:3000").rstrip("/")
 GITEA_TOKEN = os.environ.get("GITEA_TOKEN", "")
 GITEA_TIMEOUT = 10.0
@@ -58,16 +95,19 @@ def _status_payload() -> dict:
                 "url": GITEA_URL,
                 "configured": bool(GITEA_URL),
                 "authenticated": bool(GITEA_TOKEN),
+                "enabled": GITEA_TOOLS_ENABLED,
             },
             "harbor": {
                 "url": HARBOR_URL,
                 "configured": bool(HARBOR_URL),
                 "authenticated": bool(HARBOR_USER and HARBOR_PASSWORD),
+                "enabled": HARBOR_TOOLS_ENABLED,
             },
             "detector": {
                 "url": DETECTOR_URL,
                 "configured": bool(DETECTOR_URL),
                 "authenticated": bool(DETECTOR_API_KEY),
+                "enabled": DETECTOR_TOOLS_ENABLED,
             },
         },
         "tools_planned": {
@@ -103,6 +143,28 @@ def apply_safety_mode():
         for tool_name in DESTRUCTIVE_TOOLS:
             if tool_name in mcp._tool_manager._tools:
                 del mcp._tool_manager._tools[tool_name]
+
+
+def apply_domain_filters():
+    """Strip tools whose domain is disabled via MCP_EXTERNAL_<DOMAIN>_ENABLED.
+
+    Run AFTER `apply_safety_mode` so the safety strip already removed
+    any write/destructive tools; this pass strips additional tools by
+    domain availability. The two filters compose: a tool disabled by
+    either pass stays disabled.
+    """
+    to_strip: set[str] = set()
+    if not GITEA_TOOLS_ENABLED:
+        to_strip |= GITEA_TOOLS
+    if not HARBOR_TOOLS_ENABLED:
+        to_strip |= HARBOR_TOOLS
+    if not DETECTOR_TOOLS_ENABLED:
+        to_strip |= DETECTOR_TOOLS
+
+    for tool_name in to_strip:
+        if tool_name in mcp._tool_manager._tools:
+            del mcp._tool_manager._tools[tool_name]
+            logger.info("Stripped tool %s (domain disabled)", tool_name)
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -841,9 +903,16 @@ async def detector_submit_rca(
 
 if __name__ == "__main__":
     apply_safety_mode()
+    apply_domain_filters()
     logger.info("mcp-external starting on 0.0.0.0:8002 (streamable-http)")
     logger.info(
         "GITEA_URL=%s  HARBOR_URL=%s  DETECTOR_URL=%s",
         GITEA_URL, HARBOR_URL, DETECTOR_URL or "(unset)",
+    )
+    logger.info(
+        "domains: gitea=%s harbor=%s detector=%s",
+        "on" if GITEA_TOOLS_ENABLED else "off",
+        "on" if HARBOR_TOOLS_ENABLED else "off",
+        "on" if DETECTOR_TOOLS_ENABLED else "off",
     )
     mcp.run(transport="streamable-http")

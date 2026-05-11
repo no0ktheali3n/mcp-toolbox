@@ -53,6 +53,11 @@ this MCP server to trace the actual source.
 | `DETECTOR_URL` | _empty_ | Detector base URL for `detector_submit_rca`. Unset = tool returns `detector_not_configured` and degrades gracefully. |
 | `DETECTOR_API_KEY` | _empty_ | Optional `X-API-KEY` for the detector. Required only when the detector's own `MANUAL_RCA_API_KEYS` list is populated. |
 | `MCP_SAFETY_MODE` | `full` | Tool filter mode (`detector_submit_rca` is in `WRITE_TOOLS`, so `read-only` mode strips it). |
+| `MCP_EXTERNAL_GITEA_ENABLED` | `true` | Per-domain enable flag. `false` strips all `gitea_*` tools at startup so the agent doesn't see tools the deployment can't authenticate to. |
+| `MCP_EXTERNAL_HARBOR_ENABLED` | `true` | Per-domain enable flag. `false` strips all `harbor_*` tools at startup. |
+| `MCP_EXTERNAL_DETECTOR_ENABLED` | `true` | Per-domain enable flag. `false` strips `detector_submit_rca` at startup. |
+
+The three per-domain flags are independent and compose with `MCP_SAFETY_MODE`: a tool removed by either filter stays removed. Useful when a deployment ships before all upstream credentials are provisioned — flip the relevant domain to `false` so the agent's tool surface reflects what's actually reachable.
 
 ## Dev loop (matches mcp-k8s pattern)
 
