@@ -18,8 +18,12 @@ logger = logging.getLogger("mcp-k8s")
 # Safety mode configuration
 MCP_SAFETY_MODE = os.environ.get("MCP_SAFETY_MODE", "full")  # full, read-only, non-destructive
 
-# Define tool categories for safety mode filtering
-WRITE_TOOLS = {'apply_manifest', 'delete_resource', 'restart_deployment', 'scale_deployment', 'exec_command', 'patch_resource_limits'}
+# Define tool categories for safety mode filtering.
+# restart_container (SIGTERM PID 1 → kubelet restarts container, Pod preserved)
+# and restart_pod (delete pod → controller recreates) are both controlled
+# cycles. They sit in WRITE_TOOLS (stripped in read-only) but NOT in
+# DESTRUCTIVE_TOOLS — both available in `non-destructive` and `full`.
+WRITE_TOOLS = {'apply_manifest', 'delete_resource', 'restart_deployment', 'restart_container', 'restart_pod', 'scale_deployment', 'exec_command', 'patch_resource_limits', 'rollback_deployment'}
 DESTRUCTIVE_TOOLS = {'delete_resource'}
 
 mcp = FastMCP("mcp-k8s", host="0.0.0.0", port=8000)
@@ -436,6 +440,185 @@ def restart_deployment(name: str, namespace: str = "default") -> str:
     }
     apps().patch_namespaced_deployment(name, namespace, patch)
     return f"Restarted deployment/{name}"
+
+
+@mcp.tool(annotations={"idempotent": False, "destructive": False, "read_only": False})
+def restart_container(pod_name: str, namespace: str = "default", container: str = "", reason: str = "") -> dict:
+    """Restart a container inside a pod by signaling PID 1 — preserves the Pod
+    object, IP, and ephemeral state. Prefer this over restart_pod.
+
+    Use when one container is unresponsive but the Pod object itself is
+    fine. kubelet sees PID 1 exit and recreates just that container per
+    the pod's restartPolicy. The Pod object, its IP, its ServiceAccount
+    token, sidecar containers, and emptyDir mounts all persist — far
+    less disruption than delete-and-recreate.
+
+    container arg defaults to the first container in the pod's spec.
+    For multi-container pods, name the target explicitly.
+
+    Tries two signal methods, falling back if the image lacks one:
+      1. /bin/sh -c 'kill -TERM 1' (works for most images)
+      2. kill -TERM 1 (direct binary, some distroless images)
+    If both fail (no shell, no kill binary), returns exec_unavailable
+    — operator falls back to restart_pod for the heavier path.
+
+    Honors the mutation denylist (MCP_K8S_DENYLIST). If "Pod" is denied,
+    returns mutation_denied without calling the k8s API.
+
+    After calling this, re-run get_pod_detail after ~5s and look for an
+    incremented restartCount on the target container.
+    """
+    denied = _guard_kind("Pod", "restart_container")
+    if denied:
+        return denied
+
+    try:
+        pod = core().read_namespaced_pod(pod_name, namespace)
+    except ApiException as e:
+        if e.status == 404:
+            return {"error": "pod_not_found", "pod": pod_name, "namespace": namespace}
+        return {"error": "api_error", "status_code": e.status, "message": str(e)}
+
+    containers = pod.spec.containers or []
+    if not containers:
+        return {"error": "no_containers", "pod": pod_name}
+
+    target_name = container or containers[0].name
+    if container and not any(c.name == container for c in containers):
+        return {
+            "error": "container_not_found",
+            "pod": pod_name,
+            "container": container,
+            "available": [c.name for c in containers],
+        }
+
+    attempts = [
+        (['/bin/sh', '-c', 'kill -TERM 1'], "shell"),
+        (['kill', '-TERM', '1'], "direct"),
+    ]
+    last_error = None
+    for cmd, label in attempts:
+        try:
+            stream(
+                core().connect_get_namespaced_pod_exec,
+                pod_name, namespace,
+                container=target_name,
+                command=cmd,
+                stdout=True, stderr=True, stdin=False, tty=False,
+            )
+            _audit({
+                "tool": "restart_container",
+                "pod": pod_name,
+                "namespace": namespace,
+                "container": target_name,
+                "method": label,
+                "reason": reason or None,
+            })
+            return {
+                "ok": True,
+                "pod": pod_name,
+                "namespace": namespace,
+                "container": target_name,
+                "method": label,
+                "reason": reason or "(no reason supplied)",
+                "next_step": (
+                    f"kubelet will recreate container {target_name} within ~5s. "
+                    "Re-run get_pod_detail and look for an incremented "
+                    "restartCount on this container."
+                ),
+            }
+        except Exception as e:
+            last_error = e
+            continue
+
+    return {
+        "error": "exec_unavailable",
+        "pod": pod_name,
+        "container": target_name,
+        "message": (
+            "Could not signal PID 1 in the container — likely a distroless "
+            "image without /bin/sh or a kill binary. Consider restart_pod as "
+            "the fallback (delete-and-recreate; controller rolls a fresh pod)."
+        ),
+        "last_error": str(last_error) if last_error else "unknown",
+    }
+
+
+@mcp.tool(annotations={"idempotent": False, "destructive": False, "read_only": False})
+def restart_pod(pod_name: str, namespace: str = "default", reason: str = "") -> dict:
+    """Fallback: delete a pod so its owner controller recreates it. Heavier
+    than restart_container — try restart_container first.
+
+    Use only when restart_container is not viable (distroless image
+    returned exec_unavailable) OR when ephemeral pod state itself is
+    suspect (emptyDir corruption, stale in-memory cache that survives
+    a container restart, IP-binding issues that need a fresh address).
+    Otherwise prefer restart_container, which preserves the Pod object,
+    IP, ServiceAccount token, sidecars, and emptyDir mounts.
+
+    Owner safety: refuses pods without a controlling owner (static pods,
+    bare pods) because deleting those loses them rather than restarting
+    them. Returns a structured error in that case instead of acting.
+
+    Honors the mutation denylist (MCP_K8S_DENYLIST). If "Pod" is denied,
+    returns mutation_denied without calling the k8s API.
+
+    After calling this, re-run get_pod_detail or list_pods after ~10s
+    to confirm the new pod is Running + Ready. One attempt only — if
+    the symptom recurs on the recreated pod, diagnose further rather
+    than looping restart_pod.
+    """
+    denied = _guard_kind("Pod", "restart_pod")
+    if denied:
+        return denied
+
+    try:
+        pod = core().read_namespaced_pod(pod_name, namespace)
+    except ApiException as e:
+        if e.status == 404:
+            return {"error": "pod_not_found", "pod": pod_name, "namespace": namespace}
+        return {"error": "api_error", "status_code": e.status, "message": str(e)}
+
+    owner_refs = pod.metadata.owner_references or []
+    controlling_owner = next((ref for ref in owner_refs if ref.controller), None)
+    if controlling_owner is None:
+        return {
+            "error": "unowned_pod",
+            "pod": pod_name,
+            "namespace": namespace,
+            "message": (
+                "Pod has no controlling owner — deleting it would lose it, "
+                "not restart it. Use restart_deployment / scale_deployment "
+                "or the workload's typed mutation tool instead."
+            ),
+        }
+
+    try:
+        core().delete_namespaced_pod(pod_name, namespace, grace_period_seconds=30)
+    except ApiException as e:
+        return {"error": "delete_failed", "status_code": e.status, "message": str(e)}
+
+    _audit({
+        "tool": "restart_pod",
+        "pod": pod_name,
+        "namespace": namespace,
+        "owner_kind": controlling_owner.kind,
+        "owner_name": controlling_owner.name,
+        "reason": reason or None,
+    })
+
+    return {
+        "ok": True,
+        "pod": pod_name,
+        "namespace": namespace,
+        "owner": {"kind": controlling_owner.kind, "name": controlling_owner.name},
+        "reason": reason or "(no reason supplied)",
+        "next_step": (
+            f"Owner {controlling_owner.kind}/{controlling_owner.name} will "
+            "recreate the pod within seconds. Re-run get_pod_detail or "
+            "list_pods after ~10s to verify the new pod is Running + Ready."
+        ),
+    }
 
 
 @mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
