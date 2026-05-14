@@ -1264,6 +1264,152 @@ def patch_resource_limits(
     }
 
 
+# ── rollback_deployment ────────────────────────────────────────────────────────
+
+@mcp.tool(annotations={"idempotent": False, "destructive": True, "read_only": False})
+def rollback_deployment(
+    name: str,
+    namespace: str = "default",
+    to_revision: int | None = None,
+) -> dict:
+    """Roll a Deployment back to a previous revision.
+
+    Finds the ReplicaSet owned by this Deployment at the target revision
+    and patches the Deployment's pod template back to that ReplicaSet's
+    template. This mirrors kubectl rollout undo semantics.
+
+    Args:
+        name: Deployment name.
+        namespace: Kubernetes namespace (default "default").
+        to_revision: Target revision number. If None, rolls back to the
+            immediately-previous revision (current - 1). If specified,
+            the revision must exist in the Deployment's ReplicaSet history.
+
+    Returns:
+        dict with:
+          - rolled_back (bool): True if a patch was applied.
+          - from_revision (str): Revision before the rollback.
+          - to_revision (str): Revision selected as the target.
+          - error (str, optional): Short error code on failure.
+          - reason (str, optional): Human-readable error detail.
+    """
+    a = apps()
+    try:
+        dep = a.read_namespaced_deployment(name, namespace)
+    except ApiException as e:
+        return {
+            "rolled_back": False,
+            "error": "deployment_not_found",
+            "reason": f"{e.status}: {e.reason}",
+            "from_revision": None,
+            "to_revision": None,
+        }
+
+    annotations = (dep.metadata.annotations or {})
+    current_rev = annotations.get("deployment.kubernetes.io/revision")
+
+    # Gather owned ReplicaSets with their revisions.
+    match_labels = dep.spec.selector.match_labels or {}
+    label_selector = ",".join(f"{k}={v}" for k, v in match_labels.items())
+    rs_list = a.list_namespaced_replica_set(namespace, label_selector=label_selector)
+
+    owned = []
+    for rs in rs_list.items:
+        owner_refs = rs.metadata.owner_references or []
+        is_owned = any(
+            ref.kind == "Deployment" and ref.name == name and ref.controller
+            for ref in owner_refs
+        )
+        if not is_owned:
+            continue
+        rs_rev = (rs.metadata.annotations or {}).get("deployment.kubernetes.io/revision")
+        if rs_rev is None:
+            continue
+        try:
+            owned.append((int(rs_rev), rs))
+        except ValueError:
+            continue
+
+    if not owned:
+        return {
+            "rolled_back": False,
+            "error": "no_revisions_found",
+            "reason": "no owned ReplicaSets with revision annotations",
+            "from_revision": current_rev,
+            "to_revision": None,
+        }
+
+    owned.sort(key=lambda t: t[0])
+
+    try:
+        current_rev_int = int(current_rev) if current_rev is not None else None
+    except ValueError:
+        current_rev_int = None
+
+    if to_revision is None:
+        candidates = [r for r, _ in owned if current_rev_int is None or r < current_rev_int]
+        if not candidates:
+            return {
+                "rolled_back": False,
+                "error": "no_previous_revision",
+                "reason": "no revision strictly below current; only this revision exists",
+                "from_revision": current_rev,
+                "to_revision": None,
+            }
+        target_rev = max(candidates)
+    else:
+        target_rev = int(to_revision)
+        if target_rev not in [r for r, _ in owned]:
+            return {
+                "rolled_back": False,
+                "error": "target_revision_not_found",
+                "reason": f"revision {target_rev} not present; available: {sorted(r for r,_ in owned)}",
+                "from_revision": current_rev,
+                "to_revision": None,
+            }
+        if current_rev_int is not None and target_rev == current_rev_int:
+            return {
+                "rolled_back": False,
+                "error": "target_revision_is_current",
+                "reason": f"revision {target_rev} is already the current revision",
+                "from_revision": current_rev,
+                "to_revision": str(target_rev),
+            }
+
+    target_rs = next(rs for rev, rs in owned if rev == target_rev)
+    target_template = target_rs.spec.template
+
+    # Drop pod-template-hash so the controller computes a fresh one for the
+    # new ReplicaSet — mirrors `kubectl rollout undo` behavior.
+    template_dict = a.api_client.sanitize_for_serialization(target_template)
+    try:
+        labels = template_dict.get("metadata", {}).get("labels", {}) or {}
+        labels.pop("pod-template-hash", None)
+        if "metadata" in template_dict:
+            template_dict["metadata"]["labels"] = labels
+    except Exception:
+        pass
+
+    patch_body = {"spec": {"template": template_dict}}
+
+    try:
+        a.patch_namespaced_deployment(name, namespace, patch_body)
+    except ApiException as e:
+        return {
+            "rolled_back": False,
+            "error": "api_error",
+            "reason": f"{e.status}: {e.reason}",
+            "from_revision": current_rev,
+            "to_revision": str(target_rev),
+        }
+
+    return {
+        "rolled_back": True,
+        "from_revision": current_rev,
+        "to_revision": str(target_rev),
+    }
+
+
 # ── Entrypoint ───────────────────────────────────────────────────────────────────
 
 # Apply safety mode restrictions after all tools are registered
