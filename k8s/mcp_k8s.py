@@ -462,16 +462,9 @@ def restart_container(pod_name: str, namespace: str = "default", container: str 
     If both fail (no shell, no kill binary), returns exec_unavailable
     — operator falls back to restart_pod for the heavier path.
 
-    Honors the mutation denylist (MCP_K8S_DENYLIST). If "Pod" is denied,
-    returns mutation_denied without calling the k8s API.
-
     After calling this, re-run get_pod_detail after ~5s and look for an
     incremented restartCount on the target container.
     """
-    denied = _guard_kind("Pod", "restart_container")
-    if denied:
-        return denied
-
     try:
         pod = core().read_namespaced_pod(pod_name, namespace)
     except ApiException as e:
@@ -560,18 +553,11 @@ def restart_pod(pod_name: str, namespace: str = "default", reason: str = "") -> 
     bare pods) because deleting those loses them rather than restarting
     them. Returns a structured error in that case instead of acting.
 
-    Honors the mutation denylist (MCP_K8S_DENYLIST). If "Pod" is denied,
-    returns mutation_denied without calling the k8s API.
-
     After calling this, re-run get_pod_detail or list_pods after ~10s
     to confirm the new pod is Running + Ready. One attempt only — if
     the symptom recurs on the recreated pod, diagnose further rather
     than looping restart_pod.
     """
-    denied = _guard_kind("Pod", "restart_pod")
-    if denied:
-        return denied
-
     try:
         pod = core().read_namespaced_pod(pod_name, namespace)
     except ApiException as e:
