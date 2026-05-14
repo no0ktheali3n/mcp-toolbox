@@ -12,8 +12,17 @@ from kubernetes.client.rest import ApiException
 from kubernetes.stream import stream
 from mcp.server.fastmcp import FastMCP
 
+from mutation_guard import (
+    ACTIVE_DENYLIST,
+    denial_response,
+    guard as _guard_kind,
+    is_kind_denied,
+    load_denylist_from_env,
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-k8s")
+logger.info("mutation_guard active denylist: %s", sorted(ACTIVE_DENYLIST))
 
 # Safety mode configuration
 MCP_SAFETY_MODE = os.environ.get("MCP_SAFETY_MODE", "full")  # full, read-only, non-destructive
@@ -426,7 +435,15 @@ def scale_deployment(name: str, replicas: int, namespace: str = "default") -> st
 
 @mcp.tool(annotations={"idempotent": False, "destructive": True, "read_only": False})
 def restart_deployment(name: str, namespace: str = "default") -> str:
-    """Perform a rolling restart of a deployment"""
+    """Perform a rolling restart of a deployment.
+
+    Honors the operator mutation denylist (MCP_K8S_DENYLIST). If
+    "Deployment" is denied, returns a structured mutation_denied dict
+    without calling the k8s API.
+    """
+    denied = _guard_kind("Deployment", "restart_deployment")
+    if denied:
+        return denied
     patch = {
         "spec": {
             "template": {
@@ -462,9 +479,16 @@ def restart_container(pod_name: str, namespace: str = "default", container: str 
     If both fail (no shell, no kill binary), returns exec_unavailable
     — operator falls back to restart_pod for the heavier path.
 
+    Honors the mutation denylist (MCP_K8S_DENYLIST). If "Pod" is denied,
+    returns mutation_denied without calling the k8s API.
+
     After calling this, re-run get_pod_detail after ~5s and look for an
     incremented restartCount on the target container.
     """
+    denied = _guard_kind("Pod", "restart_container")
+    if denied:
+        return denied
+
     try:
         pod = core().read_namespaced_pod(pod_name, namespace)
     except ApiException as e:
@@ -553,11 +577,18 @@ def restart_pod(pod_name: str, namespace: str = "default", reason: str = "") -> 
     bare pods) because deleting those loses them rather than restarting
     them. Returns a structured error in that case instead of acting.
 
+    Honors the mutation denylist (MCP_K8S_DENYLIST). If "Pod" is denied,
+    returns mutation_denied without calling the k8s API.
+
     After calling this, re-run get_pod_detail or list_pods after ~10s
     to confirm the new pod is Running + Ready. One attempt only — if
     the symptom recurs on the recreated pod, diagnose further rather
     than looping restart_pod.
     """
+    denied = _guard_kind("Pod", "restart_pod")
+    if denied:
+        return denied
+
     try:
         pod = core().read_namespaced_pod(pod_name, namespace)
     except ApiException as e:
@@ -884,7 +915,17 @@ def apply_manifest(manifest_yaml: str) -> str:
 
 @mcp.tool(annotations={"idempotent": False, "destructive": True, "read_only": False})
 def delete_resource(resource_type: str, name: str, namespace: str = "default") -> str:
-    """Delete a Kubernetes resource. resource_type examples: pod, deployment, service, configmap"""
+    """Delete a Kubernetes resource. resource_type examples: pod, deployment, service, configmap.
+
+    Honors the operator mutation denylist (`MCP_K8S_DENYLIST`). If the
+    `resource_type` matches a denied kind (case-insensitive), returns a
+    structured `{"error": "mutation_denied", ...}` dict without invoking
+    kubectl. Default-denied kinds: Secret, ClusterRole, ClusterRoleBinding,
+    ServiceAccount.
+    """
+    denied = _guard_kind(resource_type, "delete_resource")
+    if denied:
+        return denied
     return kubectl("delete", resource_type, name, "-n", namespace)
 
 
@@ -1077,6 +1118,15 @@ def patch_resource_limits(
             "unsupported_kind",
             detail=f"kind must be one of {sorted(_PATCH_SUPPORTED_KINDS)}, got {kind!r}",
         )
+    # Guard 1b: operator mutation denylist
+    if is_kind_denied(kind, ACTIVE_DENYLIST):
+        _audit({**audit_base, "outcome": "denied_by_operator", "reason_rejected": "mutation_denied"})
+        return denial_response(kind, "patch_resource_limits", extra={
+            "name": name,
+            "namespace": namespace,
+            "container": container,
+            "dry_run": dry_run,
+        })
     if not limits and not requests:
         return _reject(
             "nothing_to_patch",
@@ -1278,7 +1328,14 @@ def rollback_deployment(
           - to_revision (str): Revision selected as the target.
           - error (str, optional): Short error code on failure.
           - reason (str, optional): Human-readable error detail.
+
+    Denied-by-operator behaviour mirrors other mutation tools: returns
+    a structured mutation_denied dict instead of calling the API.
     """
+    denied = _guard_kind("Deployment", "rollback_deployment")
+    if denied:
+        return denied
+
     a = apps()
     try:
         dep = a.read_namespaced_deployment(name, namespace)

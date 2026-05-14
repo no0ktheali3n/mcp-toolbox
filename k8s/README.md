@@ -289,14 +289,64 @@ Apply a Kubernetes YAML manifest to the cluster.
 ---
 
 #### `delete_resource(resource_type, name, namespace="default")`
-Delete a Kubernetes resource.
+Delete a Kubernetes resource. Honors the operator mutation denylist (see
+below) — if `resource_type` matches a denied kind (case-insensitive),
+returns a structured `{"error": "mutation_denied", ...}` dict without
+calling the API.
 
 **Parameters:**
 - `resource_type` — Resource kind (e.g., "pod", "deployment", "service", "configmap")
 - `name` — Resource name
 - `namespace` — Namespace (default: "default")
 
-**Returns:** kubectl delete output.
+**Returns:** kubectl delete output, or a `mutation_denied` dict.
+
+---
+
+### Operator mutation denylist (`MCP_K8S_DENYLIST`)
+
+Operators can forbid the agent from mutating specific Kubernetes resource
+kinds. Mutation tools (`patch_resource_limits`, `restart_deployment`,
+`restart_container`, `restart_pod`, `rollback_deployment`, `delete_resource`)
+route through the denylist before calling the API. Denied requests return
+a structured error dict:
+
+```json
+{
+  "error": "mutation_denied",
+  "kind": "Secret",
+  "tool": "restart_deployment",
+  "reason": "operator denylist",
+  "denylist_env_var": "MCP_K8S_DENYLIST"
+}
+```
+
+**Default denylist:** `Secret`, `ClusterRole`, `ClusterRoleBinding`, `ServiceAccount`
+
+**Override:** set `MCP_K8S_DENYLIST` to a comma-separated list of kinds
+(PascalCase). The env var REPLACES the default; repeat the baseline kinds
+to extend rather than replace:
+
+```bash
+# Replace default with an empty denylist (DANGEROUS)
+MCP_K8S_DENYLIST= docker compose up -d
+
+# Add Pod on top of the default
+MCP_K8S_DENYLIST=Secret,ClusterRole,ClusterRoleBinding,ServiceAccount,Pod docker compose up -d
+```
+
+Matching is case-insensitive. Denylist is read once at container start —
+it is a deploy-time decision, not a runtime toggle.
+
+Implementation: `mutation_guard.py` exposes `DEFAULT_DENYLIST`,
+`ACTIVE_DENYLIST`, `is_kind_denied()`, `load_denylist_from_env()`, and
+`guard()` as the single source of truth.
+
+**Why this matters more than the apiserver-side RBAC alone:** RBAC returns
+a generic `403 Forbidden` for both "kind denied" and "specific resource
+denied/absent," which LLM agents have been observed to misinterpret as
+evidence the resource does not exist. The denylist returns a distinct,
+structured `mutation_denied` shape the agent can reason on unambiguously.
 
 ---
 
