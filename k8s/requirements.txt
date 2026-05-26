@@ -1,2 +1,8 @@
 mcp[cli]>=1.0.0
-kubernetes>=28.1.0
+# Pinned to 35.0.0 — kubernetes-python 36.0.0 introduced a regression
+# where load_incluster_config() populates Configuration.api_key but the
+# request layer never sends the Authorization header, so every API call
+# from an in-cluster pod authenticates as system:anonymous and returns
+# 403 on cluster-scoped reads. Verified via urllib3 wire trace + apiserver
+# TokenReview. Stay on 35.0.0 until the upstream library ships a fix.
+kubernetes==35.0.0
