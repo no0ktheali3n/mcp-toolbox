@@ -32,7 +32,7 @@ MCP_SAFETY_MODE = os.environ.get("MCP_SAFETY_MODE", "full")  # full, read-only, 
 # and restart_pod (delete pod → controller recreates) are both controlled
 # cycles. They sit in WRITE_TOOLS (stripped in read-only) but NOT in
 # DESTRUCTIVE_TOOLS — both available in `non-destructive` and `full`.
-WRITE_TOOLS = {'apply_manifest', 'delete_resource', 'restart_deployment', 'restart_container', 'restart_pod', 'scale_deployment', 'exec_command', 'patch_resource_limits', 'rollback_deployment', 'reconcile_flux_resource'}
+WRITE_TOOLS = {'apply_manifest', 'delete_resource', 'restart_deployment', 'restart_container', 'restart_pod', 'scale_deployment', 'exec_command', 'patch_resource_limits', 'rollback_deployment', 'reconcile_flux_resource', 'suspend_flux_resource', 'resume_flux_resource'}
 DESTRUCTIVE_TOOLS = {'delete_resource'}
 
 mcp = FastMCP("mcp-k8s", host="0.0.0.0", port=8000)
@@ -1511,6 +1511,48 @@ def _dry_run_patch(kind: str, name: str, namespace: str, patch: dict) -> dict:
     return res.to_dict() if hasattr(res, "to_dict") else res
 
 
+# Flux/GitOps controllers that own resources (managedFields manager names).
+_FLUX_CONTROLLERS = {"kustomize-controller", "helm-controller"}
+
+
+def _flux_provenance(manifest: dict) -> dict:
+    """Detect GitOps/Flux ownership from a resource manifest so a remediation can be
+    framed honestly: on a Flux-managed resource a live patch is a STOPGAP (reverted on
+    the next reconcile) — the durable fix is the git source.
+
+    Names the Flux OWNER (HelmRelease/Kustomization) from the resource's own labels.
+    Exact deployment->source-repo/owner resolution is left to a routing catalog (not
+    integrated here) — this only identifies the owning Flux object."""
+    meta = manifest.get("metadata", {}) or {}
+    labels = meta.get("labels", {}) or {}
+    mf = meta.get("managedFields") or meta.get("managed_fields") or []
+    managers = {f.get("manager") for f in mf if isinstance(f, dict)}
+    helm = labels.get("helm.toolkit.fluxcd.io/name")
+    helm_ns = labels.get("helm.toolkit.fluxcd.io/namespace")
+    kust = labels.get("kustomize.toolkit.fluxcd.io/name")
+    kust_ns = labels.get("kustomize.toolkit.fluxcd.io/namespace")
+    if not (helm or kust or (managers & _FLUX_CONTROLLERS)):
+        return {"flux_managed": False}
+    if helm:
+        flux_source = f"HelmRelease {helm_ns or '?'}/{helm}"
+    elif kust:
+        flux_source = f"Kustomization {kust_ns or '?'}/{kust}"
+    else:
+        flux_source = "controller=" + ",".join(sorted(managers & _FLUX_CONTROLLERS))
+    return {
+        "flux_managed": True,
+        "flux_source": flux_source,
+        "durability": (f"STOPGAP — a live patch is reverted on the next Flux reconcile of "
+                       f"{flux_source}. The durable fix belongs in that source's git repo."),
+        "recommendation": ("apply the patch in-cluster as a stopgap to stabilize now; to hold it "
+                           "through an incident use suspend_flux_resource (pause reconcile) -> apply "
+                           "-> land the durable fix in git -> resume_flux_resource. Never leave Flux suspended."),
+        "traceability": ("DEFERRED — exact deployment->source-repo/owner resolution (a routing "
+                         "catalog) is not integrated here. Resolve the repo manually, or trace this "
+                         "owner's chart sourceRef (get_flux_status / get_custom_resource) one more hop."),
+    }
+
+
 @mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
 def propose_patch(kind: str, name: str, namespace: str, patch: dict,
                   patch_type: str = "strategic") -> dict:
@@ -1557,6 +1599,7 @@ def propose_patch(kind: str, name: str, namespace: str, patch: dict,
         "validated": validated,
         "applied": False,
         "requires_operator": True,
+        "flux": _flux_provenance(current),
         "apply_hint": (f"operator review + apply: kubectl -n {namespace} patch "
                        f"{kind.lower()} {name} -p '<patch>'  (or the typed mcp-k8s tool)"),
     }
@@ -2213,6 +2256,62 @@ def reconcile_flux_resource(kind: str, name: str, namespace: str = "default",
         "annotations": body["metadata"]["annotations"],
         "note": "reconcile requested; re-check get_flux_status after ~10-30s to verify Ready",
     }
+
+
+# ── Flux suspend / resume ───────────────────────────────────────────────────────
+#
+# Pause/resume reconciliation by patching spec.suspend on a HelmRelease/Kustomization.
+# Used to HOLD an in-cluster stopgap patch through an incident instead of having Flux
+# revert it (see _flux_provenance): suspend -> apply stopgap -> land the durable git
+# fix -> resume. Rides the existing Flux patch RBAC (same grant reconcile_flux_resource
+# uses) — NO new RBAC. Mutating (spec change) -> in WRITE_TOOLS, stripped in read-only.
+
+def _flux_suspend_patch(kind: str, name: str, namespace: str, suspend: bool) -> dict:
+    bad = _validate_flux_kind(kind)
+    if bad:
+        return bad
+    canonical = _canonical_flux_kind(kind)
+    group, plural, _ = _FLUX_KINDS[canonical]
+    body = {"spec": {"suspend": suspend}}
+    try:
+        version = _flux_served_version(group)
+        custom().patch_namespaced_custom_object(group, version, namespace, plural, name, body)
+    except ApiException as e:
+        return _wrap_api_exception(e, kind=canonical, operation="patch",
+                                   namespace=namespace, name=name)
+    _audit({"event": "suspend_flux_resource" if suspend else "resume_flux_resource",
+            "kind": canonical, "name": name, "namespace": namespace, "suspend": suspend})
+    return {
+        "suspended": suspend,
+        "kind": canonical, "name": name, "namespace": namespace,
+        "note": ("Flux reconciliation PAUSED — in-cluster changes now persist. ALWAYS "
+                 "resume_flux_resource once the durable fix lands in git; a forgotten suspend "
+                 "leaves the resource drifting from source."
+                 if suspend else
+                 "Flux reconciliation RESUMED — the git source is authoritative again; any "
+                 "in-cluster drift will be reconciled away."),
+    }
+
+
+@mcp.tool(annotations={"idempotent": False, "destructive": False, "read_only": False})
+def suspend_flux_resource(kind: str, name: str, namespace: str = "default") -> dict:
+    """Pause Flux reconciliation of a HelmRelease/Kustomization (sets spec.suspend=true)
+    so an in-cluster stopgap patch HOLDS instead of being reverted on the next reconcile.
+
+    Use during an incident: suspend -> apply the stopgap (patch_resource_limits / apply)
+    -> land the durable fix in the git source -> resume_flux_resource. ALWAYS pair with a
+    resume — a forgotten suspend silently freezes the resource against its git source.
+    Patches spec.suspend only; rides the existing Flux patch RBAC (no new grant).
+    """
+    return _flux_suspend_patch(kind, name, namespace, True)
+
+
+@mcp.tool(annotations={"idempotent": False, "destructive": False, "read_only": False})
+def resume_flux_resource(kind: str, name: str, namespace: str = "default") -> dict:
+    """Resume Flux reconciliation of a HelmRelease/Kustomization (sets spec.suspend=false).
+    The git source becomes authoritative again and any in-cluster drift (e.g. a stopgap
+    patch) is reconciled away. Use once the durable fix has landed in the git source."""
+    return _flux_suspend_patch(kind, name, namespace, False)
 
 
 # ── Cluster summary + selector search + Loki ───────────────────────────────────
