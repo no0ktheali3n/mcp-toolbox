@@ -405,6 +405,120 @@ def exec_command(
     return resp
 
 
+# ── Read-only exec (allowlisted, non-mutating in-container diagnosis) ───────────
+#
+# exec_command (above) is all-or-nothing: it sits in WRITE_TOOLS and is stripped
+# in read-only / non-destructive safety mode. read_only_exec fills the gap — a
+# curated allowlist of NON-MUTATING diagnostic commands that stays available in
+# the strict safety posture. Commands arrive as argv lists (no shell), so the
+# wall is: (1) basename(argv[0]) must be allowlisted, (2) dual-mode binaries are
+# gated to read-only subcommand prefixes, (3) shells + shell-metacharacters are
+# rejected outright (defense-in-depth against a binary re-spawning a shell).
+#
+# IMPORTANT: pods/exec RBAC does NOT distinguish read from write — the allowlist
+# IS the wall, enforced in-process. So the allowlist stays conservative. It
+# deliberately EXCLUDES raw file/env readers (cat, env, printenv): in-container
+# exec can read secret material mounted into the container (env-injected creds,
+# mounted Secret volumes); excluding them keeps a read-only-secrets posture intact.
+
+_EXEC_SHELLS = {"sh", "bash", "zsh", "ash", "dash", "ksh", "csh", "tcsh", "fish"}
+_SHELL_METACHARS = set(";|&$`><\n")
+
+# Allowed argv prefixes (read-only). A command matches iff basename(argv[0])
+# equals prefix[0] AND argv[1:len(prefix)] equals prefix[1:] (case-insensitive
+# on the subcommand tokens). Trailing args (keys, flags, hosts) are permitted.
+_EXEC_ALLOWED_PREFIXES = [
+    ["etcdctl", "member", "list"],
+    ["etcdctl", "endpoint", "health"],
+    ["etcdctl", "endpoint", "status"],
+    ["etcdctl", "get"],            # etcd read
+    ["redis-cli", "ping"],
+    ["redis-cli", "info"],
+    ["redis-cli", "dbsize"],
+    ["redis-cli", "get"],
+    ["redis-cli", "ttl"],
+    ["redis-cli", "client", "list"],
+    ["nginx", "-T"],
+    ["nginx", "-t"],
+    ["pg_isready"],
+    ["ss"],
+    ["ip"],
+    ["nslookup"],
+    ["dig"],
+    ["getent"],
+    ["ps"],
+    ["df"],
+]
+
+
+def _is_allowed_exec(command: list) -> tuple[bool, str]:
+    """Gate a command (argv list) for read_only_exec. Returns (allowed, reason).
+
+    reason ∈ {ok, empty_command, shell_not_allowed, shell_metacharacter,
+              command_not_allowed}.
+    """
+    if not command or not isinstance(command, list):
+        return (False, "empty_command")
+    binary = os.path.basename(str(command[0]))
+    if binary in _EXEC_SHELLS:
+        return (False, "shell_not_allowed")
+    for arg in command:
+        if any(ch in _SHELL_METACHARS for ch in str(arg)):
+            return (False, "shell_metacharacter")
+    for prefix in _EXEC_ALLOWED_PREFIXES:
+        if binary != prefix[0] or len(command) < len(prefix):
+            continue
+        rest = [str(t).lower() for t in command[1:len(prefix)]]
+        if rest == [str(t).lower() for t in prefix[1:]]:
+            return (True, "ok")
+    return (False, "command_not_allowed")
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def read_only_exec(
+    pod_name: str,
+    command: list[str],
+    namespace: str = "default",
+    container: str = "",
+) -> dict:
+    """Run an ALLOWLISTED, read-only diagnostic command inside a pod and return
+    its output. Unlike exec_command, this survives MCP_SAFETY_MODE=read-only.
+
+    Allowed: etcdctl (member list / endpoint health|status / get), pg_isready,
+    redis-cli (ping/info/dbsize/get/ttl/client list), nginx -T|-t, ss, ip,
+    nslookup, dig, getent, ps, df. Pass command as an argv list, e.g.
+    ['etcdctl','member','list']. Shells, write subcommands, and shell
+    metacharacters are rejected -> {error: command_not_allowed}. For anything
+    outside the allowlist an operator uses exec_command.
+    """
+    allowed, why = _is_allowed_exec(command)
+    if not allowed:
+        return {
+            "error": "command_not_allowed",
+            "reason": why,
+            "command": command,
+            "hint": "read_only_exec runs only allowlisted read-only diagnostics "
+                    "(etcdctl member list / endpoint health, pg_isready, "
+                    "redis-cli ping/info, nginx -T, ss, ip, nslookup, dig, ps, df). "
+                    "Broader or mutating exec is operator-only via exec_command.",
+        }
+    kwargs = {"command": command}
+    if container:
+        kwargs["container"] = container
+    try:
+        out = stream(
+            core().connect_get_namespaced_pod_exec,
+            pod_name, namespace,
+            stdout=True, stderr=True, stdin=False, tty=False,
+            **kwargs,
+        )
+    except ApiException as e:
+        return _wrap_api_exception(e, kind="pods/exec", operation="exec",
+                                   namespace=namespace, name=pod_name)
+    return {"pod": pod_name, "namespace": namespace, "container": container or None,
+            "command": command, "allowed": True, "stdout": out}
+
+
 # ── Deployments ─────────────────────────────────────────────────────────────────
 
 @mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
