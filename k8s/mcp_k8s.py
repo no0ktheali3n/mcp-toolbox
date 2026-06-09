@@ -1455,6 +1455,172 @@ def rollback_deployment(
 
 # ── Entrypoint ───────────────────────────────────────────────────────────────────
 
+# ── Generic resource read (CRDs + describe + storage) ──────────────────────────
+
+def custom() -> client.CustomObjectsApi:
+    return client.CustomObjectsApi()
+
+
+def storage() -> client.StorageV1Api:
+    return client.StorageV1Api()
+
+
+def _wrap_api_exception(e, *, kind, operation, namespace=None, name=None) -> dict:
+    """Translate a kubernetes ApiException into a structured error dict.
+    403 -> permission_denied (RBAC, not absence), 404 -> not_found,
+    409 -> conflict, else api_error."""
+    base = {"kind": kind, "operation": operation, "status_code": e.status}
+    if namespace:
+        base["namespace"] = namespace
+    if name:
+        base["name"] = name
+    if e.status == 403:
+        return {**base, "error": "permission_denied",
+                "note": "RBAC denies this — not evidence the resource is absent"}
+    if e.status == 404:
+        return {**base, "error": "not_found"}
+    if e.status == 409:
+        return {**base, "error": "conflict", "message": str(e)}
+    return {**base, "error": "api_error", "message": str(e),
+            "reason": getattr(e, "reason", None)}
+
+
+def _get_api(name: str):
+    if name == "core":
+        return core()
+    if name == "apps":
+        return apps()
+    if name == "batch":
+        return client.BatchV1Api()
+    if name == "storage":
+        return storage()
+    raise ValueError(f"unknown api: {name}")
+
+
+# kind -> (read_fn, api, is_namespaced)
+_YAML_KIND_DISPATCH = {
+    "pod": ("read_namespaced_pod", "core", True),
+    "service": ("read_namespaced_service", "core", True),
+    "configmap": ("read_namespaced_config_map", "core", True),
+    "secret": ("read_namespaced_secret", "core", True),
+    "namespace": ("read_namespace", "core", False),
+    "node": ("read_node", "core", False),
+    "persistentvolume": ("read_persistent_volume", "core", False),
+    "persistentvolumeclaim": ("read_namespaced_persistent_volume_claim", "core", True),
+    "deployment": ("read_namespaced_deployment", "apps", True),
+    "daemonset": ("read_namespaced_daemon_set", "apps", True),
+    "statefulset": ("read_namespaced_stateful_set", "apps", True),
+    "replicaset": ("read_namespaced_replica_set", "apps", True),
+    "job": ("read_namespaced_job", "batch", True),
+    "volumeattachment": ("read_volume_attachment", "storage", False),
+    "storageclass": ("read_storage_class", "storage", False),
+}
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def get_resource_yaml(kind: str, name: str, namespace: str | None = None) -> dict:
+    """Return the raw manifest (as a dict) for any supported built-in resource,
+    managedFields stripped. Useful for reasoning about config drift."""
+    kind_lower = kind.lower()
+    if kind_lower not in _YAML_KIND_DISPATCH:
+        return {"error": "unsupported_kind", "kind": kind,
+                "supported": sorted(_YAML_KIND_DISPATCH.keys())}
+    fn_name, api_name, is_namespaced = _YAML_KIND_DISPATCH[kind_lower]
+    api = _get_api(api_name)
+    try:
+        if is_namespaced:
+            if not namespace:
+                return {"error": "namespace_required", "kind": kind_lower}
+            obj = getattr(api, fn_name)(name, namespace)
+        else:
+            obj = getattr(api, fn_name)(name)
+    except ApiException as e:
+        return _wrap_api_exception(e, kind=kind_lower, operation="get",
+                                   namespace=namespace, name=name)
+    return {"kind": kind_lower, "name": name, "namespace": namespace,
+            "manifest": strip_managed_fields(obj.to_dict())}
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def get_custom_resource(group: str, version: str, plural: str, name: str,
+                        namespace: str | None = None) -> dict:
+    """Read any custom resource (CRD instance) by GVR + name.
+
+    Works for any installed CRD (HelmRelease, cert-manager Challenge/Order,
+    VirtualMachineInstance, Cilium*, Gateway/HTTPRoute, VolumeSnapshot, ...).
+    Pass namespace=None for a cluster-scoped CRD. managedFields are stripped;
+    a 403 returns permission_denied (NOT evidence of absence)."""
+    try:
+        if namespace:
+            obj = custom().get_namespaced_custom_object(
+                group, version, namespace, plural, name)
+        else:
+            obj = custom().get_cluster_custom_object(group, version, plural, name)
+    except ApiException as e:
+        return _wrap_api_exception(e, kind=plural, operation="get",
+                                   namespace=namespace, name=name)
+    return {"group": group, "version": version, "plural": plural,
+            "name": name, "namespace": namespace,
+            "manifest": strip_managed_fields(obj)}
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def list_custom_resources(group: str, version: str, plural: str,
+                          namespace: str | None = None,
+                          label_selector: str | None = None) -> dict:
+    """List custom resources (CRD instances) by GVR. Pass namespace=None for a
+    cluster-wide list. Returns a compact row per item (name/namespace); follow
+    up with get_custom_resource for a full manifest. 403 -> permission_denied."""
+    kwargs: dict = {}
+    if label_selector:
+        kwargs["label_selector"] = label_selector
+    try:
+        if namespace:
+            resp = custom().list_namespaced_custom_object(
+                group, version, namespace, plural, **kwargs)
+        else:
+            resp = custom().list_cluster_custom_object(
+                group, version, plural, **kwargs)
+    except ApiException as e:
+        return _wrap_api_exception(e, kind=plural, operation="list",
+                                   namespace=namespace)
+    items = [
+        {"name": it.get("metadata", {}).get("name"),
+         "namespace": it.get("metadata", {}).get("namespace")}
+        for it in resp.get("items", [])
+    ]
+    return {"items": items, "count": len(items),
+            "scope": namespace or "cluster-wide"}
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def describe_resource(kind: str, name: str, namespace: str | None = None) -> dict:
+    """kubectl-describe-style read for any kind in the resource-YAML dispatch:
+    the object's conditions plus its involvedObject Events. Underlying read
+    errors pass through; an Events RBAC denial degrades to an empty events list
+    (manifest + conditions still return)."""
+    base = get_resource_yaml(kind=kind, name=name, namespace=namespace)
+    if base.get("error"):
+        return base
+    manifest = base.get("manifest", {})
+    conditions = (manifest.get("status") or {}).get("conditions", []) or []
+    involved_kind = manifest.get("kind", kind)
+    field_selector = f"involvedObject.name={name},involvedObject.kind={involved_kind}"
+    events: list = []
+    try:
+        if namespace:
+            ev = core().list_namespaced_event(namespace, field_selector=field_selector)
+        else:
+            ev = core().list_event_for_all_namespaces(field_selector=field_selector)
+        events = [{"type": e.type, "reason": e.reason, "message": e.message,
+                   "count": e.count, "lastTimestamp": str(e.last_timestamp)}
+                  for e in ev.items]
+    except ApiException:
+        events = []
+    return {"kind": kind, "name": name, "namespace": namespace,
+            "conditions": conditions, "events": events, "manifest": manifest}
+
+
 # Apply safety mode restrictions after all tools are registered
 apply_safety_mode()
 
