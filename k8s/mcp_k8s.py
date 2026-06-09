@@ -1621,6 +1621,172 @@ def describe_resource(kind: str, name: str, namespace: str | None = None) -> dic
             "conditions": conditions, "events": events, "manifest": manifest}
 
 
+# ── Live resource metrics (kubectl-top-equivalent) ─────────────────────────────
+#
+# metrics.k8s.io is an aggregated API served by metrics-server. It is reachable
+# through the same CustomObjectsApi (custom()) the generic-read tools use, so
+# top_pods / top_nodes need no new client surface — just GVR list calls plus
+# quantity parsing. Read-only. When metrics-server is absent the aggregated API
+# answers 404/503, surfaced as `metrics_unavailable` (distinct from a 403
+# permission_denied) so callers don't misread "no API" as "no usage".
+
+_METRICS_GROUP = "metrics.k8s.io"
+_METRICS_VERSION = "v1beta1"
+
+_MEM_BINARY = {"Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3, "Ti": 1024 ** 4,
+               "Pi": 1024 ** 5, "Ei": 1024 ** 6}
+_MEM_DECIMAL = {"k": 1000, "M": 1000 ** 2, "G": 1000 ** 3, "T": 1000 ** 4,
+                "P": 1000 ** 5, "E": 1000 ** 6}
+
+
+def _parse_cpu(q: str | None) -> int:
+    """Parse a Kubernetes CPU quantity into integer millicores (rounded).
+
+    metrics-server typically reports nanocores ("143750000n"); also handles
+    micro ("u"), milli ("m"), and whole cores (no suffix). Empty/None -> 0.
+    """
+    if not q:
+        return 0
+    s = str(q).strip()
+    try:
+        if s.endswith("n"):
+            return round(int(s[:-1]) / 1e6)
+        if s.endswith("u"):
+            return round(int(s[:-1]) / 1e3)
+        if s.endswith("m"):
+            return round(float(s[:-1]))
+        return round(float(s) * 1000)
+    except ValueError:
+        return 0
+
+
+def _parse_mem(q: str | None) -> int:
+    """Parse a Kubernetes memory quantity into integer bytes.
+
+    Handles binary suffixes (Ki/Mi/Gi/Ti/...), decimal suffixes (k/M/G/...),
+    and plain byte counts. Empty/None -> 0.
+    """
+    if not q:
+        return 0
+    s = str(q).strip()
+    for suf, mult in _MEM_BINARY.items():
+        if s.endswith(suf):
+            try:
+                return int(float(s[:-len(suf)]) * mult)
+            except ValueError:
+                return 0
+    for suf, mult in _MEM_DECIMAL.items():
+        if s.endswith(suf):
+            try:
+                return int(float(s[:-1]) * mult)
+            except ValueError:
+                return 0
+    try:
+        return int(float(s))
+    except ValueError:
+        return 0
+
+
+def _mem_human(num_bytes: int) -> str:
+    """Render bytes as integer Mi (kubectl-top style)."""
+    return f"{round(num_bytes / 1024 / 1024)}Mi"
+
+
+def _metrics_error(e: ApiException, *, plural: str, namespace: str | None = None) -> dict:
+    """Map an aggregated-metrics-API error: 404/503 (metrics-server absent) ->
+    metrics_unavailable; everything else (incl. 403) through the shared mapper."""
+    if e.status in (404, 503):
+        return {"error": "metrics_unavailable", "status": e.status,
+                "detail": "metrics.k8s.io unavailable — is metrics-server installed?"}
+    return _wrap_api_exception(e, kind=f"{plural}.{_METRICS_GROUP}",
+                               operation="list", namespace=namespace)
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def top_nodes(sort_by: str = "cpu") -> dict:
+    """Live node resource usage (kubectl top nodes) via metrics.k8s.io.
+
+    Returns one row per node {name, cpu_millicores, cpu_human, memory_bytes,
+    memory_human, timestamp}, sorted descending by `sort_by` ("cpu" | "memory").
+    A 403 returns permission_denied; a 404/503 (metrics-server absent) returns
+    metrics_unavailable — NOT evidence of zero usage.
+    """
+    try:
+        resp = custom().list_cluster_custom_object(
+            _METRICS_GROUP, _METRICS_VERSION, "nodes")
+    except ApiException as e:
+        return _metrics_error(e, plural="nodes")
+    rows = []
+    for it in resp.get("items", []):
+        usage = it.get("usage", {})
+        cpu_m = _parse_cpu(usage.get("cpu"))
+        mem_b = _parse_mem(usage.get("memory"))
+        rows.append({
+            "name": it.get("metadata", {}).get("name"),
+            "cpu_millicores": cpu_m, "cpu_human": f"{cpu_m}m",
+            "memory_bytes": mem_b, "memory_human": _mem_human(mem_b),
+            "timestamp": it.get("timestamp"),
+        })
+    key = "memory_bytes" if sort_by == "memory" else "cpu_millicores"
+    rows.sort(key=lambda r: r[key], reverse=True)
+    return {"nodes": rows, "count": len(rows), "sorted_by": sort_by}
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def top_pods(namespace: str | None = None, sort_by: str = "cpu",
+             limit: int = 20, containers: bool = False) -> dict:
+    """Live pod resource usage (kubectl top pods) via metrics.k8s.io.
+
+    Per pod, container usage is summed for the total; pass containers=True to
+    also get the per-container breakdown. Pass namespace=None for cluster-wide.
+    Sorted descending by `sort_by` ("cpu" | "memory"), capped at `limit` with
+    {returned, total} reported so truncation is never silent. A 403 returns
+    permission_denied; 404/503 returns metrics_unavailable.
+    """
+    try:
+        if namespace:
+            resp = custom().list_namespaced_custom_object(
+                _METRICS_GROUP, _METRICS_VERSION, namespace, "pods")
+        else:
+            resp = custom().list_cluster_custom_object(
+                _METRICS_GROUP, _METRICS_VERSION, "pods")
+    except ApiException as e:
+        return _metrics_error(e, plural="pods", namespace=namespace)
+    rows = []
+    for it in resp.get("items", []):
+        cpu_m = 0
+        mem_b = 0
+        breakdown = []
+        for c in it.get("containers", []) or []:
+            u = c.get("usage", {})
+            c_cpu = _parse_cpu(u.get("cpu"))
+            c_mem = _parse_mem(u.get("memory"))
+            cpu_m += c_cpu
+            mem_b += c_mem
+            if containers:
+                breakdown.append({
+                    "name": c.get("name"),
+                    "cpu_millicores": c_cpu, "cpu_human": f"{c_cpu}m",
+                    "memory_bytes": c_mem, "memory_human": _mem_human(c_mem)})
+        row = {
+            "name": it.get("metadata", {}).get("name"),
+            "namespace": it.get("metadata", {}).get("namespace"),
+            "cpu_millicores": cpu_m, "cpu_human": f"{cpu_m}m",
+            "memory_bytes": mem_b, "memory_human": _mem_human(mem_b),
+            "timestamp": it.get("timestamp"),
+        }
+        if containers:
+            row["containers"] = breakdown
+        rows.append(row)
+    key = "memory_bytes" if sort_by == "memory" else "cpu_millicores"
+    rows.sort(key=lambda r: r[key], reverse=True)
+    total = len(rows)
+    if limit and limit > 0:
+        rows = rows[:limit]
+    return {"pods": rows, "returned": len(rows), "total": total,
+            "sorted_by": sort_by, "scope": namespace or "cluster-wide"}
+
+
 # ── Flux reconciliation (read + reconcile) ─────────────────────────────────────
 # kind -> (apiGroup, plural, force_capable). force (reconcile.fluxcd.io/forceAt)
 # is only meaningful for HelmRelease/Kustomization; sources ignore it.
