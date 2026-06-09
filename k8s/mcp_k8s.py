@@ -32,7 +32,7 @@ MCP_SAFETY_MODE = os.environ.get("MCP_SAFETY_MODE", "full")  # full, read-only, 
 # and restart_pod (delete pod → controller recreates) are both controlled
 # cycles. They sit in WRITE_TOOLS (stripped in read-only) but NOT in
 # DESTRUCTIVE_TOOLS — both available in `non-destructive` and `full`.
-WRITE_TOOLS = {'apply_manifest', 'delete_resource', 'restart_deployment', 'restart_container', 'restart_pod', 'scale_deployment', 'exec_command', 'patch_resource_limits', 'rollback_deployment'}
+WRITE_TOOLS = {'apply_manifest', 'delete_resource', 'restart_deployment', 'restart_container', 'restart_pod', 'scale_deployment', 'exec_command', 'patch_resource_limits', 'rollback_deployment', 'reconcile_flux_resource'}
 DESTRUCTIVE_TOOLS = {'delete_resource'}
 
 mcp = FastMCP("mcp-k8s", host="0.0.0.0", port=8000)
@@ -1619,6 +1619,397 @@ def describe_resource(kind: str, name: str, namespace: str | None = None) -> dic
         events = []
     return {"kind": kind, "name": name, "namespace": namespace,
             "conditions": conditions, "events": events, "manifest": manifest}
+
+
+# ── Flux reconciliation (read + reconcile) ─────────────────────────────────────
+# kind -> (apiGroup, plural, force_capable). force (reconcile.fluxcd.io/forceAt)
+# is only meaningful for HelmRelease/Kustomization; sources ignore it.
+_FLUX_KINDS = {
+    "HelmRelease":    ("helm.toolkit.fluxcd.io",      "helmreleases",     True),
+    "Kustomization":  ("kustomize.toolkit.fluxcd.io", "kustomizations",   True),
+    "GitRepository":  ("source.toolkit.fluxcd.io",    "gitrepositories",  False),
+    "OCIRepository":  ("source.toolkit.fluxcd.io",    "ocirepositories",  False),
+    "HelmRepository": ("source.toolkit.fluxcd.io",    "helmrepositories", False),
+    "HelmChart":      ("source.toolkit.fluxcd.io",    "helmcharts",       False),
+}
+
+_FLUX_KIND_BY_LOWER = {k.lower(): k for k in _FLUX_KINDS}
+
+
+def _canonical_flux_kind(kind: str) -> str | None:
+    return _FLUX_KIND_BY_LOWER.get((kind or "").strip().lower())
+
+
+def _validate_flux_kind(kind: str) -> dict | None:
+    """None if kind is a known Flux kind, else a structured error dict."""
+    if _canonical_flux_kind(kind) is None:
+        return {
+            "error": "unsupported_kind",
+            "kind": kind,
+            "supported": sorted(_FLUX_KINDS),
+            "note": "reconcile_flux_resource only operates on Flux resources",
+        }
+    return None
+
+
+def _flux_reconcile_patch_body(kind: str, force: bool, now_iso: str) -> dict:
+    """Annotation-only merge-patch body that triggers a Flux reconcile.
+    The annotation value must change each call for Flux to act. forceAt is added
+    only for force-capable kinds when force=True. Never touches .spec."""
+    canonical = _canonical_flux_kind(kind)
+    ann = {"reconcile.fluxcd.io/requestedAt": now_iso}
+    if force and canonical and _FLUX_KINDS[canonical][2]:
+        ann["reconcile.fluxcd.io/forceAt"] = now_iso
+    return {"metadata": {"annotations": ann}}
+
+
+def _parse_flux_status(obj: dict) -> dict:
+    """Distill a Flux custom object into the fields the agent reasons over."""
+    md = obj.get("metadata", {}) or {}
+    spec = obj.get("spec", {}) or {}
+    status = obj.get("status", {}) or {}
+    conds = status.get("conditions", []) or []
+    ready = next((c for c in conds if c.get("type") == "Ready"), {})
+    return {
+        "kind": obj.get("kind"),
+        "namespace": md.get("namespace"),
+        "name": md.get("name"),
+        "ready": ready.get("status") == "True",
+        "reason": ready.get("reason"),
+        "message": ready.get("message"),
+        "suspended": bool(spec.get("suspend", False)),
+        "lastAppliedRevision": status.get("lastAppliedRevision")
+        or status.get("lastAttemptedRevision"),
+        "lastHandledReconcileAt": status.get("lastHandledReconcileAt"),
+    }
+
+
+def _flux_served_version(group: str) -> str:
+    """Preferred served version for a Flux API group, resolved at call time so
+    the tools survive Flux CRD version bumps (e.g. HelmRelease v2beta2 -> v2).
+
+    ApisApi has no get_api_group(name) in the kubernetes 35.x client — enumerate
+    via get_api_versions() and match by group name."""
+    groups = client.ApisApi().get_api_versions().groups
+    grp = next((g for g in groups if g.name == group), None)
+    if grp is None or grp.preferred_version is None:
+        raise ApiException(status=404, reason=f"Flux API group not served: {group}")
+    return grp.preferred_version.version
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def get_flux_status(kind: str | None = None, name: str | None = None,
+                    namespace: str | None = None) -> dict:
+    """Read Flux reconciliation state.
+
+    - kind + name: focused status for one resource.
+    - name omitted: SCAN — returns Flux resources whose Ready != True. Scoped to
+      `namespace` when given, cluster-wide only when namespace is omitted.
+    Supported kinds: HelmRelease, Kustomization, GitRepository, OCIRepository,
+    HelmRepository, HelmChart. Returns distilled status. Focused lookup requires
+    a namespace.
+    """
+    if kind is not None and (err := _validate_flux_kind(kind)):
+        return err
+
+    kinds = [_canonical_flux_kind(kind)] if kind else list(_FLUX_KINDS)
+
+    if name is not None:
+        if namespace is None:
+            return {"error": "namespace_required",
+                    "note": "focused lookup needs a namespace; omit name for a cluster-wide scan"}
+        canonical = kinds[0]
+        group, plural, _ = _FLUX_KINDS[canonical]
+        try:
+            version = _flux_served_version(group)
+            obj = custom().get_namespaced_custom_object(
+                group, version, namespace, plural, name)
+        except ApiException as e:
+            return _wrap_api_exception(e, kind=canonical, operation="get",
+                                       namespace=namespace, name=name)
+        return _parse_flux_status(obj)
+
+    stalled, errors = [], []
+    for canonical in kinds:
+        group, plural, _ = _FLUX_KINDS[canonical]
+        try:
+            version = _flux_served_version(group)
+            if namespace:
+                resp = custom().list_namespaced_custom_object(
+                    group, version, namespace, plural)
+            else:
+                resp = custom().list_cluster_custom_object(group, version, plural)
+        except ApiException as e:
+            errors.append(_wrap_api_exception(e, kind=canonical, operation="list",
+                                              namespace=namespace))
+            continue
+        for obj in resp.get("items", []):
+            s = _parse_flux_status(obj)
+            if not s["ready"]:
+                stalled.append(s)
+    result = {"stalled": stalled, "count": len(stalled),
+              "scope": namespace or "cluster-wide"}
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+@mcp.tool(annotations={"idempotent": False, "destructive": False, "read_only": False})
+def reconcile_flux_resource(kind: str, name: str, namespace: str = "default",
+                            force: bool = False) -> dict:
+    """Trigger a Flux reconcile of a stalled resource by setting the
+    reconcile.fluxcd.io/requestedAt annotation (and forceAt when force=True for
+    HelmRelease/Kustomization — needed to reset a RetriesExceeded circuit-break).
+
+    Annotation-only: never mutates .spec, never deletes. A 403 surfaces as
+    permission_denied so the caller escalates rather than looping. Non-destructive:
+    available in non-destructive + full safety modes; stripped in read-only.
+    """
+    bad = _validate_flux_kind(kind)
+    if bad:
+        return bad
+    canonical = _canonical_flux_kind(kind)
+    group, plural, _ = _FLUX_KINDS[canonical]
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+    body = _flux_reconcile_patch_body(canonical, force, now_iso)
+    try:
+        version = _flux_served_version(group)
+        custom().patch_namespaced_custom_object(
+            group, version, namespace, plural, name, body)
+    except ApiException as e:
+        return _wrap_api_exception(e, kind=canonical, operation="patch",
+                                   namespace=namespace, name=name)
+    return {
+        "reconciled": True,
+        "kind": canonical, "name": name, "namespace": namespace, "force": force,
+        "annotations": body["metadata"]["annotations"],
+        "note": "reconcile requested; re-check get_flux_status after ~10-30s to verify Ready",
+    }
+
+
+# ── Cluster summary + selector search + Loki ───────────────────────────────────
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def get_cluster_summary() -> dict:
+    """Single-call cluster-wide health snapshot.
+
+    Returns aggregate counts for nodes, pods, deployments, and namespaces so
+    the caller can form a top-level picture without chaining 5+ list calls.
+    """
+    nodes = core().list_node()
+    node_ready = 0
+    node_not_ready = 0
+    for n in nodes.items:
+        ready_cond = next(
+            (c for c in (n.status.conditions or []) if c.type == "Ready"),
+            None,
+        )
+        if ready_cond and ready_cond.status == "True":
+            node_ready += 1
+        else:
+            node_not_ready += 1
+
+    pods = core().list_pod_for_all_namespaces()
+    pod_counts = {"running": 0, "pending": 0, "failed": 0, "succeeded": 0, "crashloop": 0}
+    for p in pods.items:
+        phase = (p.status.phase or "").lower()
+        if phase in pod_counts:
+            pod_counts[phase] += 1
+        for cs in (p.status.container_statuses or []):
+            if cs.state and cs.state.waiting and cs.state.waiting.reason == "CrashLoopBackOff":
+                pod_counts["crashloop"] += 1
+                break
+
+    deps = apps().list_deployment_for_all_namespaces()
+    dep_available = 0
+    dep_progressing = 0
+    dep_stuck = 0
+    for d in deps.items:
+        conds = (d.status.conditions or []) if d.status else []
+        is_available = any(c.type == "Available" and c.status == "True" for c in conds)
+        is_progressing = any(c.type == "Progressing" and c.status == "True" for c in conds)
+        is_stuck = any(
+            c.type == "Progressing" and c.reason == "ProgressDeadlineExceeded"
+            for c in conds
+        )
+        if is_stuck:
+            dep_stuck += 1
+        elif is_available:
+            dep_available += 1
+        elif is_progressing:
+            dep_progressing += 1
+
+    nss = core().list_namespace()
+
+    return {
+        "nodes": {"ready": node_ready, "not_ready": node_not_ready, "total": len(nodes.items)},
+        "pods": pod_counts,
+        "deployments": {
+            "available": dep_available,
+            "progressing": dep_progressing,
+            "stuck": dep_stuck,
+            "total": len(deps.items),
+        },
+        "namespace_count": len(nss.items),
+    }
+
+
+# Mapping: kind -> (list_namespaced_fn, list_all_ns_fn, api_getter)
+_SEARCH_KIND_DISPATCH = {
+    "pod": ("list_namespaced_pod", "list_pod_for_all_namespaces", "core"),
+    "service": ("list_namespaced_service", "list_service_for_all_namespaces", "core"),
+    "configmap": ("list_namespaced_config_map", "list_config_map_for_all_namespaces", "core"),
+    "secret": ("list_namespaced_secret", "list_secret_for_all_namespaces", "core"),
+    "deployment": ("list_namespaced_deployment", "list_deployment_for_all_namespaces", "apps"),
+    "daemonset": ("list_namespaced_daemon_set", "list_daemon_set_for_all_namespaces", "apps"),
+    "statefulset": ("list_namespaced_stateful_set", "list_stateful_set_for_all_namespaces", "apps"),
+    "job": ("list_namespaced_job", "list_job_for_all_namespaces", "batch"),
+}
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def search_resources(
+    kind: str,
+    label_selector: str | None = None,
+    field_selector: str | None = None,
+    namespace: str | None = None,
+    limit: int = 100,
+    continue_token: str | None = None,
+) -> dict:
+    """Label/field-selector search across a given resource kind.
+
+    Supported kinds: pod, deployment, service, configmap, secret, job,
+    daemonset, statefulset. Pass `namespace=None` to search cluster-wide.
+    Pagination via `limit` + `continue_token`.
+    """
+    kind_lower = kind.lower().rstrip("s") if kind.lower().endswith("sets") else kind.lower()
+    if kind_lower not in _SEARCH_KIND_DISPATCH:
+        return {
+            "error": "unsupported_kind",
+            "kind": kind,
+            "supported": sorted(_SEARCH_KIND_DISPATCH.keys()),
+        }
+
+    ns_fn, all_ns_fn, api_name = _SEARCH_KIND_DISPATCH[kind_lower]
+    api = _get_api(api_name)
+
+    kwargs = {"limit": limit}
+    if label_selector:
+        kwargs["label_selector"] = label_selector
+    if field_selector:
+        kwargs["field_selector"] = field_selector
+    if continue_token:
+        kwargs["_continue"] = continue_token
+
+    try:
+        if namespace:
+            result = getattr(api, ns_fn)(namespace, **kwargs)
+        else:
+            result = getattr(api, all_ns_fn)(**kwargs)
+    except ApiException as e:
+        return _wrap_api_exception(e, kind=kind_lower, operation="search",
+                                   namespace=namespace)
+
+    items = [
+        {
+            "kind": kind_lower,
+            "name": r.metadata.name,
+            "namespace": r.metadata.namespace,
+            "created": r.metadata.creation_timestamp.isoformat() if r.metadata.creation_timestamp else None,
+        }
+        for r in result.items
+    ]
+    next_token = None
+    if hasattr(result.metadata, "_continue") and result.metadata._continue:
+        next_token = result.metadata._continue
+
+    return {"items": items, "continue": next_token, "count": len(items)}
+
+
+# ── Loki log queries (via the API server's service-proxy) ──────────────────────
+LOKI_SERVICE = os.environ.get("LOKI_SERVICE", "loki")
+LOKI_PORT = int(os.environ.get("LOKI_PORT", "3100"))
+LOKI_NAMESPACE = os.environ.get("LOKI_NAMESPACE", "monitoring")
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def query_loki(
+    query: str,
+    start: str | None = None,
+    end: str | None = None,
+    limit: int = 100,
+) -> dict:
+    """LogQL query via the k8s API server's service-proxy to Loki.
+
+    `start`/`end` accept Loki's range formats (nanosecond epochs or RFC3339).
+    When omitted, Loki defaults to its server-side window (typically 1h).
+    Target is governed by `LOKI_SERVICE` / `LOKI_PORT` / `LOKI_NAMESPACE`
+    env vars (defaults: `loki` / `3100` / `monitoring`).
+    """
+    query_params: list[tuple[str, str]] = [("query", query), ("limit", str(limit))]
+    if start:
+        query_params.append(("start", start))
+    if end:
+        query_params.append(("end", end))
+
+    resource_path = (
+        f"/api/v1/namespaces/{LOKI_NAMESPACE}"
+        f"/services/{LOKI_SERVICE}:{LOKI_PORT}/proxy/loki/api/v1/query_range"
+    )
+
+    try:
+        api_client = core().api_client
+        raw = api_client.call_api(
+            resource_path,
+            "GET",
+            path_params={},
+            query_params=query_params,
+            header_params={"Accept": "application/json"},
+            body=None,
+            response_type=None,
+            auth_settings=["BearerToken"],
+            _preload_content=False,
+        )
+        resp = raw[0] if isinstance(raw, tuple) else raw
+        payload = resp.data.decode("utf-8") if hasattr(resp, "data") else str(resp)
+        data = json.loads(payload).get("data", {})
+    except ApiException as e:
+        return {"error": "loki_api_error", "status": e.status, "reason": e.reason}
+    except Exception as e:
+        return {"error": "loki_request_failed", "detail": str(e)}
+
+    streams = [
+        {"labels": s.get("stream", {}), "values": s.get("values", [])}
+        for s in data.get("result", [])
+    ]
+    return {
+        "streams": streams,
+        "result_type": data.get("resultType"),
+        "stream_count": len(streams),
+    }
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def search_logs(
+    namespace: str,
+    pattern: str,
+    time_range_seconds: int = 3600,
+    limit: int = 100,
+) -> dict:
+    """Regex search across all pod logs in a namespace via Loki.
+
+    Convenience wrapper around `query_loki` that builds the LogQL label
+    selector and time window.
+    """
+    import time
+
+    end_ns = int(time.time() * 1e9)
+    start_ns = end_ns - (time_range_seconds * int(1e9))
+
+    escaped = pattern.replace('"', r'\"')
+    logql = f'{{namespace="{namespace}"}} |~ "{escaped}"'
+
+    return query_loki(logql, start=str(start_ns), end=str(end_ns), limit=limit)
 
 
 # Apply safety mode restrictions after all tools are registered
