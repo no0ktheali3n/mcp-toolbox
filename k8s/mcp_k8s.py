@@ -1414,6 +1414,154 @@ def patch_resource_limits(
     }
 
 
+# ── propose_patch (remediation prep — never persists) ──────────────────────────
+#
+# Closes the "here's the fix, escalating" loop: given a target + a patch,
+# propose_patch returns the exact change staged for operator approval — a
+# before->after diff, the would-be result, and applied=false. It NEVER persists:
+# it server-side dry-runs (dryRun=All) where the agent has patch RBAC
+# (Deployment/StatefulSet/DaemonSet/ConfigMap/Service), else computes the result
+# client-side (validated=false). Honors the mutation_guard denylist — it will not
+# even PREPARE a patch for Secret/ClusterRole/ClusterRoleBinding/ServiceAccount.
+# read_only (non-mutating); stays available in read-only mode.
+
+_PROPOSE_VOLATILE_KEYS = {
+    "managedFields", "managed_fields", "resourceVersion", "resource_version",
+    "generation", "creationTimestamp", "creation_timestamp", "uid", "status",
+    "selfLink", "self_link",
+}
+
+
+def _jsonable(obj):
+    """Round-trip to JSON-native types (datetime -> str) so the diff is comparable
+    and serializable regardless of the source object's value types."""
+    return json.loads(json.dumps(obj, default=str))
+
+
+def _strip_volatile(obj):
+    """Drop apiserver-volatile fields so a before/after diff shows only real changes."""
+    if isinstance(obj, dict):
+        return {k: _strip_volatile(v) for k, v in obj.items()
+                if k not in _PROPOSE_VOLATILE_KEYS}
+    if isinstance(obj, list):
+        return [_strip_volatile(v) for v in obj]
+    return obj
+
+
+def _deep_diff(before, after, path: str = "") -> list:
+    """Recursive before->after diff. Returns [{path, from, to}] for changed leaves.
+    Lists are compared element-wise by index (a known simplification)."""
+    out: list = []
+    if isinstance(before, dict) or isinstance(after, dict):
+        b = before if isinstance(before, dict) else {}
+        a = after if isinstance(after, dict) else {}
+        for k in sorted(set(b) | set(a)):
+            sub = f"{path}.{k}" if path else k
+            out += _deep_diff(b.get(k), a.get(k), sub)
+    elif isinstance(before, list) or isinstance(after, list):
+        b = before or []
+        a = after or []
+        for i in range(max(len(b), len(a))):
+            bi = b[i] if i < len(b) else None
+            ai = a[i] if i < len(a) else None
+            out += _deep_diff(bi, ai, f"{path}[{i}]")
+    else:
+        if before != after:
+            out.append({"path": path, "from": before, "to": after})
+    return out
+
+
+def _client_merge(base: dict, patch: dict) -> dict:
+    """Local strategic-ish merge (deep dict merge; list values replace). Used only
+    when server-side dry-run is unavailable (no patch RBAC for the kind)."""
+    out = json.loads(json.dumps(base))
+
+    def _merge(d, p):
+        for k, v in p.items():
+            if isinstance(v, dict) and isinstance(d.get(k), dict):
+                _merge(d[k], v)
+            else:
+                d[k] = v
+    if isinstance(out, dict) and isinstance(patch, dict):
+        _merge(out, patch)
+    return out
+
+
+def _dry_run_patch(kind: str, name: str, namespace: str, patch: dict) -> dict:
+    """Server-side dry-run (dryRun=All) strategic-merge patch -> resulting object
+    as a dict. Validates + computes WITHOUT persisting. Raises ValueError for kinds
+    with no dry-run dispatch (caller falls back to client-side merge)."""
+    k = (kind or "").strip().lower()
+    if k in ("deployment", "statefulset", "daemonset"):
+        api = apps()
+        fn = {"deployment": api.patch_namespaced_deployment,
+              "statefulset": api.patch_namespaced_stateful_set,
+              "daemonset": api.patch_namespaced_daemon_set}[k]
+        res = fn(name, namespace, patch, dry_run="All")
+    elif k == "configmap":
+        api = core()
+        res = api.patch_namespaced_config_map(name, namespace, patch, dry_run="All")
+    elif k == "service":
+        api = core()
+        res = api.patch_namespaced_service(name, namespace, patch, dry_run="All")
+    else:
+        raise ValueError(f"no server-side dry-run dispatch for kind {kind!r}")
+    # Match get_resource_yaml's serialization (obj.to_dict()) so before/after are
+    # the same shape; propose_patch normalizes both via _jsonable (datetime->str).
+    return res.to_dict() if hasattr(res, "to_dict") else res
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def propose_patch(kind: str, name: str, namespace: str, patch: dict,
+                  patch_type: str = "strategic") -> dict:
+    """Stage a patch for operator approval WITHOUT applying it. Returns the exact
+    before->after diff + the would-be result; applies nothing.
+
+    Server-side dry-runs (dryRun=All) for kinds the agent can patch
+    (Deployment/StatefulSet/DaemonSet/ConfigMap/Service) -> validated=True; for
+    other kinds it computes the change client-side -> validated=False. Refuses to
+    prepare a patch for a mutation_guard-denied kind (Secret/ClusterRole/CRB/SA).
+    Use this to close out a diagnosed spec fix instead of stopping at a prose
+    recommendation; the operator reviews the diff and applies via the typed tool.
+    """
+    denied = _guard_kind(kind, "propose_patch")
+    if denied:
+        return denied
+    base = get_resource_yaml(kind=kind, name=name, namespace=namespace)
+    if base.get("error"):
+        return base
+    current = base.get("manifest", {}) or {}
+    before = _jsonable(_strip_volatile(current))
+
+    validated = False
+    try:
+        after = _jsonable(_strip_volatile(_dry_run_patch(kind, name, namespace, patch)))
+        validated = True
+    except ApiException as e:
+        if e.status == 403:
+            after = _jsonable(_strip_volatile(_client_merge(current, patch)))
+        else:
+            return _wrap_api_exception(e, kind=kind, operation="dry-run-patch",
+                                       namespace=namespace, name=name)
+    except ValueError:
+        after = _jsonable(_strip_volatile(_client_merge(current, patch)))
+
+    diff = _deep_diff(before, after)
+    diff_text = "; ".join(f"{d['path']}: {d['from']} -> {d['to']}" for d in diff) or "(no change)"
+    return {
+        "target": {"kind": kind, "name": name, "namespace": namespace},
+        "patch": patch,
+        "patch_type": patch_type,
+        "diff": diff,
+        "diff_text": diff_text,
+        "validated": validated,
+        "applied": False,
+        "requires_operator": True,
+        "apply_hint": (f"operator review + apply: kubectl -n {namespace} patch "
+                       f"{kind.lower()} {name} -p '<patch>'  (or the typed mcp-k8s tool)"),
+    }
+
+
 # ── rollback_deployment ────────────────────────────────────────────────────────
 
 @mcp.tool(annotations={"idempotent": False, "destructive": True, "read_only": False})
