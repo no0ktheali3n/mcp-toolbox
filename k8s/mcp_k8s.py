@@ -2092,6 +2092,142 @@ def top_pods(namespace: str | None = None, sort_by: str = "cpu",
             "sorted_by": sort_by, "scope": namespace or "cluster-wide"}
 
 
+# ── Cluster scheduling-capacity analysis ───────────────────────────────────────
+#
+# Scheduling deadlock is driven by REQUESTS (reservations), not actual usage: the
+# scheduler places a pod only if node.allocatable - SUM(requests) >= pod.requests.
+# A node can be lightly USED but requests-saturated and refuse new pods. This tool
+# makes that view legible: per-node allocatable vs SUM(requests) vs usage, schedulable
+# headroom, reclaimable over-provisioning (requests above usage), and node imbalance.
+# Read-only; no new RBAC (nodes/pods/metrics).
+
+_CAPACITY_NEAR_PCT = 85.0  # % requests-committed flagged as near scheduling capacity
+
+
+def _pod_requests(pod: dict) -> dict:
+    """Sum a pod's container resource requests -> {node, cpu_milli, mem_bytes}.
+    initContainers ignored (sum-of-containers approximation)."""
+    spec = pod.get("spec", {}) or {}
+    node = spec.get("nodeName") or spec.get("node_name")
+    cpu = mem = 0
+    for c in spec.get("containers", []) or []:
+        req = ((c.get("resources") or {}).get("requests") or {})
+        cpu += _parse_cpu(req.get("cpu"))
+        mem += _parse_mem(req.get("memory"))
+    return {"node": node, "cpu_milli": cpu, "mem_bytes": mem}
+
+
+def _assemble_capacity(nodes: list, pod_reqs: list, usage: dict) -> dict:
+    """Per-node + cluster capacity analysis from:
+      nodes:    [{name, cpu_alloc_milli, mem_alloc_bytes}]
+      pod_reqs: [{node, cpu_milli, mem_bytes}]  (one per scheduled pod)
+      usage:    {node: {cpu_milli, mem_bytes}}
+    schedulable = allocatable - requests; reclaimable = requests above usage."""
+    req_by_node: dict = {}
+    for p in pod_reqs:
+        n = p.get("node")
+        if not n:
+            continue
+        r = req_by_node.setdefault(n, {"cpu": 0, "mem": 0})
+        r["cpu"] += p.get("cpu_milli", 0) or 0
+        r["mem"] += p.get("mem_bytes", 0) or 0
+
+    def pct(x, tot):
+        return round(100 * x / tot, 1) if tot else 0.0
+
+    node_rows = []
+    for nd in nodes:
+        name = nd["name"]
+        ac, am = nd["cpu_alloc_milli"], nd["mem_alloc_bytes"]
+        rc = req_by_node.get(name, {}).get("cpu", 0)
+        rm = req_by_node.get(name, {}).get("mem", 0)
+        uc = usage.get(name, {}).get("cpu_milli", 0)
+        um = usage.get(name, {}).get("mem_bytes", 0)
+        node_rows.append({
+            "name": name,
+            "cpu": {"allocatable_milli": ac, "requests_milli": rc, "usage_milli": uc,
+                    "requests_pct": pct(rc, ac), "usage_pct": pct(uc, ac),
+                    "schedulable_milli": ac - rc, "reclaimable_milli": max(rc - uc, 0)},
+            "mem": {"allocatable_bytes": am, "requests_bytes": rm, "usage_bytes": um,
+                    "requests_pct": pct(rm, am), "usage_pct": pct(um, am),
+                    "schedulable_bytes": am - rm, "reclaimable_bytes": max(rm - um, 0)},
+        })
+    node_rows.sort(key=lambda n: n["cpu"]["requests_pct"], reverse=True)
+
+    def csum(res, key):
+        return sum(n[res][key] for n in node_rows)
+
+    cpu = {k: csum("cpu", k) for k in
+           ("allocatable_milli", "requests_milli", "usage_milli", "schedulable_milli", "reclaimable_milli")}
+    mem = {k: csum("mem", k) for k in
+           ("allocatable_bytes", "requests_bytes", "usage_bytes", "schedulable_bytes", "reclaimable_bytes")}
+    cpu["requests_pct"] = pct(cpu["requests_milli"], cpu["allocatable_milli"])
+    mem["requests_pct"] = pct(mem["requests_bytes"], mem["allocatable_bytes"])
+    cluster = {
+        "cpu": cpu, "mem": mem,
+        "nodes_near_cpu_capacity": [n["name"] for n in node_rows if n["cpu"]["requests_pct"] >= _CAPACITY_NEAR_PCT],
+        "nodes_near_mem_capacity": [n["name"] for n in node_rows if n["mem"]["requests_pct"] >= _CAPACITY_NEAR_PCT],
+    }
+    if node_rows:
+        cluster["most_committed_node"] = node_rows[0]["name"]
+        cluster["least_committed_node"] = node_rows[-1]["name"]
+        cluster["imbalance_note"] = (
+            f"{node_rows[0]['name']} {node_rows[0]['cpu']['requests_pct']}% vs "
+            f"{node_rows[-1]['name']} {node_rows[-1]['cpu']['requests_pct']}% cpu requests-committed")
+    return {
+        "nodes": node_rows,
+        "cluster": cluster,
+        "interpretation": (
+            "scheduling headroom is governed by REQUESTS (the scheduler's view), not actual usage. "
+            "schedulable = allocatable - requests; reclaimable = requests above actual usage "
+            "(right-size requests to free schedulable capacity). nodes_near_*_capacity are at/over "
+            f"{_CAPACITY_NEAR_PCT}% requests-committed — the deadlock risk."),
+    }
+
+
+@mcp.tool(annotations={"idempotent": True, "destructive": False, "read_only": True})
+def analyze_cluster_capacity() -> dict:
+    """Cluster scheduling-capacity analysis — per-node allocatable vs SUM(requests)
+    vs actual usage, schedulable headroom, reclaimable over-provisioning, and node
+    imbalance.
+
+    Scheduling deadlock is driven by REQUESTS (reservations), not usage: a node can be
+    lightly used but requests-saturated and refuse new pods. Use this to spot a cluster
+    nearing scheduling capacity, find reclaimable over-provisioning (right-size to free
+    schedulable room without adding nodes), and detect node imbalance for rebalancing.
+    Read-only; no new RBAC.
+    """
+    nodes = []
+    for n in core().list_node().items:
+        alloc = n.status.allocatable or {}
+        nodes.append({"name": n.metadata.name,
+                      "cpu_alloc_milli": _parse_cpu(alloc.get("cpu")),
+                      "mem_alloc_bytes": _parse_mem(alloc.get("memory"))})
+    pod_reqs = []
+    for p in core().list_pod_for_all_namespaces().items:
+        phase = p.status.phase if p.status else None
+        if phase in ("Succeeded", "Failed"):
+            continue
+        if not (p.spec and p.spec.node_name):
+            continue
+        conts = []
+        for c in (p.spec.containers or []):
+            req = c.resources.requests if (c.resources and c.resources.requests) else {}
+            conts.append({"resources": {"requests": dict(req)}})
+        pod_reqs.append(_pod_requests({"spec": {"nodeName": p.spec.node_name, "containers": conts}}))
+    usage = {}
+    try:
+        resp = custom().list_cluster_custom_object(_METRICS_GROUP, _METRICS_VERSION, "nodes")
+        for it in resp.get("items", []):
+            nm = it.get("metadata", {}).get("name")
+            u = it.get("usage", {})
+            usage[nm] = {"cpu_milli": _parse_cpu(u.get("cpu")),
+                         "mem_bytes": _parse_mem(u.get("memory"))}
+    except ApiException:
+        pass  # usage is optional; requests-vs-allocatable still answers schedulability
+    return _assemble_capacity(nodes, pod_reqs, usage)
+
+
 # ── Flux reconciliation (read + reconcile) ─────────────────────────────────────
 # kind -> (apiGroup, plural, force_capable). force (reconcile.fluxcd.io/forceAt)
 # is only meaningful for HelmRelease/Kustomization; sources ignore it.
